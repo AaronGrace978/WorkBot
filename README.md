@@ -10,11 +10,13 @@ A Google Gemma inspired WorkBot that gets your browser work done. Built with Tau
 - Mandatory field review before Submit, Send, Save, Confirm, or payment
 - Autonomous task loop with a 777-step ceiling
 - Persistent isolated Chrome profile that remembers website sessions
-- Windows, Linux x64/ARM64, and macOS Apple Silicon/Intel builds
+- Windows, Linux x64/ARM64, macOS Apple Silicon/Intel, and Chromebook-via-Linux builds
 
 ## Install
 
 Download the installer for your operating system from [Releases](https://github.com/AaronGrace978/WorkBot/releases).
+
+Chromebooks cannot run a native ChromeOS build. Enable Linux in ChromeOS settings, then install the `.deb` from the Linux ARM64 release (most Chromebooks) or the Linux x64 release (Intel Chromebooks). You still need Chrome inside that Linux environment, or a Chromium package the bot can launch.
 
 1. For Google Gemma models, create a key at [Google AI Studio](https://aistudio.google.com/apikey). For Ollama Cloud models, create a key at [ollama.com/settings/keys](https://ollama.com/settings/keys).
 2. Open Gemma Work Bot, pick a model, and paste the matching key into Agent settings.

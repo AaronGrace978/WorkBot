@@ -22,7 +22,7 @@ jobs:
           - name: Linux x64
             platform: ubuntu-22.04
             args: ""
-          - name: Linux ARM64
+          - name: Linux ARM64 (Chromebook)
             platform: ubuntu-22.04-arm
             args: ""
           - name: macOS Apple Silicon
@@ -79,6 +79,8 @@ jobs:
             Gemma-powered autonomous browser work agent.
 
             Download the installer for your operating system below. A Gemma API key from Google AI Studio or an Ollama Cloud key, plus Google Chrome, is required.
+
+            Chromebooks have no native Tauri target. Turn on Linux (Crostini) and install the Linux .deb: ARM Chromebooks use the ARM64 build, Intel Chromebooks use the x64 build.
           releaseDraft: false
           prerelease: false
           generateReleaseNotes: true

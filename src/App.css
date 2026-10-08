@@ -101,6 +101,10 @@ button.texty {
   backdrop-filter: blur(18px);
 }
 
+.sidebar > * {
+  flex-shrink: 0;
+}
+
 .brand {
   display: flex;
   gap: 12px;
@@ -158,6 +162,7 @@ button.texty {
 .browser-card {
   position: relative;
   overflow: hidden;
+  min-height: min-content;
 }
 
 .browser-card::before {
@@ -204,7 +209,13 @@ button.texty {
 }
 
 .stack { display: flex; flex-direction: column; gap: 8px; }
-.stack button { width: 100%; }
+.stack button {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 14px;
+  white-space: normal;
+  line-height: 1.25;
+}
 
 .tabs {
   margin: 11px 0 0;
@@ -321,9 +332,10 @@ textarea {
   text-transform: uppercase;
 }
 
-.eyebrow img, .composer-title img {
+.eyebrow svg, .composer-title svg {
   width: 14px;
   height: 14px;
+  flex: none;
 }
 
 h1, h2 {
@@ -675,9 +687,14 @@ article {
 }
 
 @media (max-width: 1050px) {
+  .app { grid-template-columns: 280px minmax(0, 1fr); }
   .top-badges { display: none; }
   .suggestions { grid-template-columns: 1fr; }
   .suggestions button { min-height: auto; }
+}
+
+@media (max-height: 780px) {
+  .sidebar { gap: 10px; padding: 14px 14px; }
 }
 
 @media (max-width: 800px) {

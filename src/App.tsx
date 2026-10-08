@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
@@ -119,6 +119,23 @@ function toolLabel(name: string) {
 
 function imageSrc(image: string) {
   return image.startsWith("data:") ? image : `data:image/jpeg;base64,${image}`;
+}
+
+function GemmaMark({ className }: { className?: string }) {
+  const id = `gemma${useId().replace(/:/g, "")}`;
+  return (
+    <svg className={className} viewBox="0 0 64 64" aria-hidden="true">
+      <defs>
+        <linearGradient id={id} x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#4285F4" />
+          <stop offset=".32" stopColor="#8E62DB" />
+          <stop offset=".62" stopColor="#EA4335" />
+          <stop offset="1" stopColor="#FBBC04" />
+        </linearGradient>
+      </defs>
+      <path fill={`url(#${id})`} d="M32 3c2.7 16.5 12.5 26.3 29 29-16.5 2.7-26.3 12.5-29 29C29.3 44.5 19.5 34.7 3 32 19.5 29.3 29.3 19.5 32 3Z" />
+    </svg>
+  );
 }
 
 async function readImage(file: File) {
@@ -397,7 +414,7 @@ export default function App() {
     <div className="app">
       <aside className="sidebar">
         <div className="brand">
-          <img className="mark" src="/gemma-mark.svg" alt="" />
+          <GemmaMark className="mark" />
           <div>
             <strong>Gemma Work Bot</strong>
             <em>
@@ -551,7 +568,7 @@ export default function App() {
       <main className="main">
         <header className="top">
           <div>
-            <div className="eyebrow"><img src="/gemma-mark.svg" alt="" /> Autonomous browser agent</div>
+            <div className="eyebrow"><GemmaMark /> Autonomous browser agent</div>
             <h1><span>Gemma</span> Work Bot</h1>
             <p>{settings.think ? "Deep reasoning, full-page vision, careful action." : "Full-page vision with fast, deliberate action."}</p>
           </div>
@@ -565,7 +582,7 @@ export default function App() {
         <div className="thread" ref={threadRef}>
           {messages.length === 0 && !booting && (
             <div className="empty">
-              <img className="hero-mark" src="/gemma-mark.svg" alt="" />
+              <GemmaMark className="hero-mark" />
               <h2>What should we get done?</h2>
               <p>Describe the outcome. Gemma scans the whole page, compares your references, and works through the task.</p>
               <div className="suggestions">
@@ -632,7 +649,7 @@ export default function App() {
             void addFiles(event.dataTransfer.files);
           }}
         >
-          <div className="composer-title"><img src="/gemma-mark.svg" alt="" /> Ask Gemma to work in Chrome</div>
+          <div className="composer-title"><GemmaMark /> Ask Gemma to work in Chrome</div>
           {images.length > 0 && (
             <div className="pending-shots">
               {images.map((image, index) => (
