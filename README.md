@@ -1,6 +1,6 @@
 # Gemma Work Bot
 
-A Google Gemma-inspired desktop agent that gets browser work done. Built with Tauri 2, React, Rust, Ollama Cloud, and Chrome DevTools Protocol.
+A Google Gemma inspired WorkBot that gets your browser work done. Built with Tauri 2, React, Rust, Ollama Cloud, and Chrome DevTools Protocol.
 
 ## Features
 
