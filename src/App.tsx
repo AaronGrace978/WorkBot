@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
@@ -123,20 +123,7 @@ function imageSrc(image: string) {
 }
 
 function GemmaMark({ className }: { className?: string }) {
-  const id = `gemma${useId().replace(/:/g, "")}`;
-  return (
-    <svg className={className} viewBox="0 0 64 64" aria-hidden="true">
-      <defs>
-        <linearGradient id={id} x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
-          <stop stopColor="#4285F4" />
-          <stop offset=".32" stopColor="#8E62DB" />
-          <stop offset=".62" stopColor="#EA4335" />
-          <stop offset="1" stopColor="#FBBC04" />
-        </linearGradient>
-      </defs>
-      <path fill={`url(#${id})`} d="M32 3c2.7 16.5 12.5 26.3 29 29-16.5 2.7-26.3 12.5-29 29C29.3 44.5 19.5 34.7 3 32 19.5 29.3 29.3 19.5 32 3Z" />
-    </svg>
-  );
+  return <img className={className} src="/workbot-mark.svg" alt="" />;
 }
 
 async function readImage(file: File) {

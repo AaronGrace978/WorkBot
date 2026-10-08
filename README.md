@@ -1,10 +1,11 @@
-# Gemma Work Bot
+# WorkBot
 
 <p align="center">
-  <img src="docs/readme-hero.jpg" alt="Gemma Work Bot — autonomous browser agent built with TypeScript, React, CSS, Rust, and Tauri" width="100%" />
+  <img src="docs/workbot-icon.png" alt="WorkBot" width="160" />
 </p>
 
 <p align="center">
+  <img alt="Built with Gemma" src="https://img.shields.io/badge/Built%20with-Gemma-4285F4?style=for-the-badge" />
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white" />
   <img alt="React" src="https://img.shields.io/badge/React-61DAFB?style=for-the-badge&logo=react&logoColor=000" />
   <img alt="CSS" src="https://img.shields.io/badge/CSS-1572B6?style=for-the-badge&logo=css&logoColor=white" />
@@ -12,7 +13,9 @@
   <img alt="Tauri" src="https://img.shields.io/badge/Tauri-24C8DB?style=for-the-badge&logo=tauri&logoColor=white" />
 </p>
 
-A Google Gemma inspired WorkBot that gets your browser work done. Built with Tauri 2, React, TypeScript, CSS, and Rust. The default **Pure Google** stack keeps every layer in the Gemma/Gemini family.
+WorkBot is an independent desktop agent that gets browser work done. It is built with Tauri 2, React, TypeScript, CSS, and Rust. The default stack can call Gemma and Gemini models. WorkBot is not a Google product.
+
+Gemma is a trademark of Google LLC.
 
 ## Features
 
@@ -65,4 +68,4 @@ Local specialists are optional. If Ollama is offline, Flash still drives the bro
 
 Use a Google AI Studio key for Pure Google and Cloud Google models, or an [Ollama Cloud](https://ollama.com/settings/keys) key for hosted Ollama Gemma models.
 
-Inspired by GrokBot, running on Google's Gemma (not an official Google product). This independent project is not affiliated with or endorsed by Google or xAI.
+Inspired by GrokBot. Built with Gemma. Not an official Google product. Gemma is a trademark of Google LLC. This independent project is not affiliated with or endorsed by Google or xAI.
