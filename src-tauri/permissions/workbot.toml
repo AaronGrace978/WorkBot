@@ -1,0 +1,11 @@
+[[permission]]
+identifier = "workbot-commands"
+description = "Commands used by Gemma Work Bot"
+commands.allow = [
+  "get_settings",
+  "save_settings",
+  "browser_status",
+  "launch_chrome",
+  "run_agent",
+  "stop_agent"
+]

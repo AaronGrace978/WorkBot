@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="gemma" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4285F4"/>
+      <stop offset=".32" stop-color="#8E62DB"/>
+      <stop offset=".62" stop-color="#EA4335"/>
+      <stop offset="1" stop-color="#FBBC04"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#gemma)" d="M32 3c2.7 16.5 12.5 26.3 29 29-16.5 2.7-26.3 12.5-29 29C29.3 44.5 19.5 34.7 3 32 19.5 29.3 29.3 19.5 32 3Z"/>
+</svg>
