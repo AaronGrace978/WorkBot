@@ -8,6 +8,8 @@ pub struct Settings {
     pub api_key: String,
     #[serde(default)]
     pub gemma_api_key: String,
+    #[serde(default = "default_ollama_host")]
+    pub ollama_host: String,
     pub model: String,
     pub think: bool,
     pub debug_port: u16,
@@ -19,7 +21,8 @@ impl Default for Settings {
         Self {
             api_key: String::new(),
             gemma_api_key: String::new(),
-            model: "gemma4:31b".into(),
+            ollama_host: default_ollama_host(),
+            model: "google-stack".into(),
             think: false,
             debug_port: 9222,
             max_steps: 777,
@@ -46,9 +49,13 @@ impl Settings {
     pub fn normalized(mut self) -> Self {
         self.api_key = self.api_key.trim().to_string();
         self.gemma_api_key = self.gemma_api_key.trim().to_string();
+        self.ollama_host = self.ollama_host.trim().trim_end_matches('/').to_string();
+        if self.ollama_host.is_empty() {
+            self.ollama_host = default_ollama_host();
+        }
         self.model = self.model.trim().to_string();
         if self.model.is_empty() {
-            self.model = "gemma4:31b".into();
+            self.model = "google-stack".into();
         }
         if self.model.len() > 80 {
             self.model.truncate(80);
@@ -64,4 +71,8 @@ impl Settings {
         self.max_steps = 777;
         self
     }
+}
+
+fn default_ollama_host() -> String {
+    "http://127.0.0.1:11434".into()
 }

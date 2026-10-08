@@ -242,6 +242,31 @@ button.texty {
   text-transform: uppercase;
 }
 
+.stack-roles {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.stack-roles li {
+  padding: 8px 2px;
+  border-bottom: 1px solid #edf0f4;
+}
+
+.stack-roles li:last-child { border-bottom: 0; }
+
+.stack-roles strong {
+  display: block;
+  color: #202124;
+  font-size: 12px;
+}
+
+.stack-roles span {
+  color: #80868b;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 label {
   color: #5f6368;
   font-size: 12px;

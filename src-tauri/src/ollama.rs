@@ -92,24 +92,76 @@ where
         return crate::gemini::chat(gemma_key, model, think, messages, tools, on_delta, cancel)
             .await;
     }
-    chat_ollama(ollama_key, model, think, messages, tools, on_delta, cancel).await
+    if ollama_key.is_empty() {
+        return Err("Add your Ollama API key in the sidebar.".into());
+    }
+    chat_endpoint(
+        CHAT_URL,
+        Some(ollama_key),
+        model,
+        think,
+        messages,
+        tools,
+        on_delta,
+        cancel,
+        32_768,
+        "Ollama Cloud",
+    )
+    .await
 }
 
-async fn chat_ollama<F>(
-    api_key: &str,
+pub fn local_chat_url(host: &str) -> String {
+    let host = host.trim().trim_end_matches('/');
+    if host.is_empty() {
+        "http://127.0.0.1:11434/api/chat".into()
+    } else if host.ends_with("/api/chat") {
+        host.to_string()
+    } else {
+        format!("{host}/api/chat")
+    }
+}
+
+pub async fn chat_local<F>(
+    host: &str,
+    model: &str,
+    messages: &[ChatMessage],
+    on_delta: F,
+    cancel: &std::sync::atomic::AtomicBool,
+    num_ctx: u32,
+) -> Result<ModelTurn, String>
+where
+    F: FnMut(&str, &str),
+{
+    chat_endpoint(
+        &local_chat_url(host),
+        None,
+        model,
+        false,
+        messages,
+        &Value::Null,
+        on_delta,
+        cancel,
+        num_ctx,
+        "local Ollama",
+    )
+    .await
+}
+
+async fn chat_endpoint<F>(
+    endpoint: &str,
+    api_key: Option<&str>,
     model: &str,
     think: bool,
     messages: &[ChatMessage],
     tools: &Value,
     mut on_delta: F,
     cancel: &std::sync::atomic::AtomicBool,
+    num_ctx: u32,
+    label: &str,
 ) -> Result<ModelTurn, String>
 where
     F: FnMut(&str, &str),
 {
-    if api_key.is_empty() {
-        return Err("Add your Ollama API key in the sidebar.".into());
-    }
 
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -119,14 +171,16 @@ where
         .build()
         .map_err(|e| e.to_string())?;
 
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "messages": messages,
-        "tools": tools,
         "stream": true,
         "think": think,
-        "options": { "temperature": 0.3, "num_ctx": 32768 }
+        "options": { "temperature": 0.3, "num_ctx": num_ctx }
     });
+    if !tools.is_null() {
+        body["tools"] = tools.clone();
+    }
 
     let mut attempt = 0u32;
     let response = loop {
@@ -135,18 +189,24 @@ where
         }
         let sent = tokio::time::timeout(
             Duration::from_secs(90),
-            client.post(CHAT_URL).bearer_auth(api_key).json(&body).send(),
+            {
+                let mut req = client.post(endpoint).json(&body);
+                if let Some(key) = api_key {
+                    req = req.bearer_auth(key);
+                }
+                req.send()
+            },
         )
         .await;
         let retry_reason = match sent {
-            Err(_) => "Ollama Cloud did not answer in 90 seconds".to_string(),
-            Ok(Err(e)) => format!("Could not reach Ollama Cloud: {e}"),
+            Err(_) => format!("{label} did not answer in 90 seconds"),
+            Ok(Err(e)) => format!("Could not reach {label}: {e}"),
             Ok(Ok(resp)) if resp.status().is_success() => break resp,
             Ok(Ok(resp)) => {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 let detail: String = text.chars().take(400).collect();
-                let message = format!("Ollama Cloud returned {status}: {detail}");
+                let message = format!("{label} returned {status}: {detail}");
                 if status.as_u16() != 429 && !status.is_server_error() {
                     return Err(message);
                 }
@@ -185,7 +245,7 @@ where
         let next = match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
             Err(_) => {
                 if last_data.elapsed() > Duration::from_secs(120) {
-                    return Err("Ollama Cloud stopped sending for 2 minutes.".into());
+                    return Err(format!("{label} stopped sending for 2 minutes."));
                 }
                 if !pending_think.is_empty() || !pending_content.is_empty() {
                     on_delta(&pending_think, &pending_content);
@@ -345,5 +405,14 @@ mod tests {
     fn parses_string_arguments() {
         let value = normalize_arguments(json!("{\"index\":2}"));
         assert_eq!(arg_i64(&value, "index"), Some(2));
+    }
+
+    #[test]
+    fn builds_local_chat_url() {
+        assert_eq!(local_chat_url(""), "http://127.0.0.1:11434/api/chat");
+        assert_eq!(
+            local_chat_url("http://127.0.0.1:11434/"),
+            "http://127.0.0.1:11434/api/chat"
+        );
     }
 }

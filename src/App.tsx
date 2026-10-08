@@ -11,6 +11,7 @@ import {
   providerFor,
   PROVIDERS,
   Settings,
+  STACK_ROLES,
   usesGemmaApi,
   ToolTrace,
 } from "./types";
@@ -154,7 +155,8 @@ export default function App() {
   const [settings, setSettings] = useState<Settings>({
     apiKey: "",
     gemmaApiKey: "",
-    model: "gemma4:31b",
+    ollamaHost: "http://127.0.0.1:11434",
+    model: "google-stack",
     think: false,
     debugPort: 9222,
     maxSteps: 777,
@@ -305,6 +307,7 @@ export default function App() {
       const saved = await invoke<Settings>("save_settings", {
         apiKey: next.apiKey,
         gemmaApiKey: next.gemmaApiKey,
+        ollamaHost: next.ollamaHost,
         model: next.model,
         think: next.think,
         debugPort: Number(next.debugPort) || 9222,
@@ -346,6 +349,7 @@ export default function App() {
         const saved = await invoke<Settings>("save_settings", {
           apiKey: settings.apiKey,
           gemmaApiKey: settings.gemmaApiKey,
+          ollamaHost: settings.ollamaHost,
           model: settings.model,
           think: settings.think,
           debugPort: Number(settings.debugPort) || 9222,
@@ -418,9 +422,13 @@ export default function App() {
           <div>
             <strong>Gemma Work Bot</strong>
             <em>
-              {usesGemmaApi(settings.model) ? "Powered by Gemma" : "Powered by Ollama Cloud"}
+              {settings.model === "google-stack"
+                ? "Pure Google stack"
+                : usesGemmaApi(settings.model)
+                  ? "Powered by Gemma"
+                  : "Powered by Ollama Cloud"}
             </em>
-            <small>Inspired by Google's Gemma (not an official Google product)</small>
+            <small>Inspired by GrokBot · Gemma (not an official Google product)</small>
           </div>
         </div>
 
@@ -461,7 +469,7 @@ export default function App() {
           <select
             value={providerFor(settings.model)}
             onChange={(event) => {
-              const next = event.target.value === "gemma" ? "gemma" : "ollama";
+              const next = event.target.value as typeof PROVIDERS[number]["id"];
               if (next === providerFor(settings.model)) return;
               void save({ ...settings, model: defaultModel(next) });
             }}
@@ -474,23 +482,34 @@ export default function App() {
           </select>
         </label>
 
-        <label>
-          Model
-          <select
-            value={settings.model}
-            onChange={(event) => void save({ ...settings, model: event.target.value })}
-          >
-            {modelsFor(providerFor(settings.model), settings.model).map((model) => (
-              <option key={model.id} value={model.id}>
-                {model.label}
-              </option>
+        {settings.model === "google-stack" ? (
+          <ul className="stack-roles">
+            {STACK_ROLES.map((item) => (
+              <li key={item.model}>
+                <strong>{item.model}</strong>
+                <span>{item.tier} · {item.role}</span>
+              </li>
             ))}
-          </select>
-        </label>
-
-        {usesGemmaApi(settings.model) ? (
+          </ul>
+        ) : (
           <label>
-            Gemma API key
+            Model
+            <select
+              value={settings.model}
+              onChange={(event) => void save({ ...settings, model: event.target.value })}
+            >
+              {modelsFor(providerFor(settings.model), settings.model).map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+
+        {usesGemmaApi(settings.model) && (
+          <label>
+            Google AI Studio key
             <input
               type="password"
               value={settings.gemmaApiKey}
@@ -499,7 +518,21 @@ export default function App() {
               onBlur={() => void save(settings)}
             />
           </label>
-        ) : (
+        )}
+
+        {settings.model === "google-stack" && (
+          <label>
+            Local Ollama
+            <input
+              value={settings.ollamaHost}
+              placeholder="http://127.0.0.1:11434"
+              onChange={(event) => setSettings({ ...settings, ollamaHost: event.target.value })}
+              onBlur={() => void save(settings)}
+            />
+          </label>
+        )}
+
+        {providerFor(settings.model) === "ollama" && (
           <label>
             Ollama API key
             <input
@@ -549,8 +582,9 @@ export default function App() {
         <p className="fine">
           Work Bot uses its own persistent Chrome profile because current Chrome
           blocks automation of your normal profile. Sign in once in the bot window.
-          Screenshots and page text go to the selected provider: Gemma via Google
-          AI Studio, or Ollama Cloud.
+          Pure Google uses local Ollama for PaliGemma 2 Mix, Gemma 3 4B, and
+          Gemma 3 1B, then Gemini 3.5 Flash (Argon if stuck) for tools. Pull
+          those three models or Flash still runs alone.
         </p>
         {banner && <p className="banner">{banner.replace(/^NEEDS_RESTART:/, "")}</p>}
         <button
@@ -709,7 +743,7 @@ export default function App() {
             )}
           </div>
         </form>
-        <p className="affiliation">Inspired by Google's Gemma (not an official Google product)</p>
+        <p className="affiliation">Inspired by GrokBot · Gemma (not an official Google product)</p>
       </main>
 
       {lightbox && (

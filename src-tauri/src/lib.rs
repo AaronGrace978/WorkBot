@@ -3,6 +3,7 @@ mod browser;
 mod gemini;
 mod ollama;
 mod settings;
+mod stack;
 
 use agent::HistoryTurn;
 use browser::Browser;
@@ -32,6 +33,7 @@ async fn save_settings(
     state: State<'_, AppState>,
     api_key: String,
     gemma_api_key: String,
+    ollama_host: String,
     model: String,
     think: bool,
     debug_port: u16,
@@ -40,6 +42,7 @@ async fn save_settings(
     let settings = Settings {
         api_key,
         gemma_api_key,
+        ollama_host,
         model,
         think,
         debug_port,

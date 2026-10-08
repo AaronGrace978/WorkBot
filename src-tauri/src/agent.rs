@@ -41,7 +41,7 @@ pub async fn run(
     images: Vec<String>,
     history: Vec<HistoryTurn>,
 ) -> Result<(), String> {
-    if crate::gemini::uses_google(&settings.model) {
+    if crate::stack::uses_stack(&settings.model) || crate::gemini::uses_google(&settings.model) {
         if settings.gemma_api_key.is_empty() {
             let err = "Add your Gemma API key from Google AI Studio.".to_string();
             emit(&app, AgentEvent::Error { text: err.clone() });
@@ -53,13 +53,23 @@ pub async fn run(
         return Err(err);
     }
     let message = message.trim().to_string();
+    let goal = if message.is_empty() {
+        "Look at the attached image.".to_string()
+    } else {
+        message.clone()
+    };
     if message.is_empty() && images.is_empty() {
         let err = "Say what you want done, or attach an image.".to_string();
         emit(&app, AgentEvent::Error { text: err.clone() });
         return Err(err);
     }
 
-    let mut messages = vec![ChatMessage::text("system", SYSTEM_PROMPT)];
+    let system = if crate::stack::uses_stack(&settings.model) {
+        format!("{SYSTEM_PROMPT}\n\n{STACK_PROMPT}")
+    } else {
+        SYSTEM_PROMPT.to_string()
+    };
+    let mut messages = vec![ChatMessage::text("system", system)];
     let recent: Vec<HistoryTurn> = history.into_iter().rev().take(12).collect();
     for turn in recent.into_iter().rev() {
         if matches!(turn.role.as_str(), "user" | "assistant") && !turn.content.trim().is_empty() {
@@ -139,6 +149,8 @@ pub async fn run(
     let mut repeats = 0u32;
     let mut error_streak = 0u32;
     let mut reviewed_since_change = false;
+    let mut next_vision = true;
+    let mut next_dom = true;
 
     for step in 0..max_steps {
         if cancel.load(Ordering::SeqCst) {
@@ -150,13 +162,57 @@ pub async fn run(
             reference_image_count,
             step == 0,
         );
+        let stuck = error_streak >= 2 || repeats >= 2;
+        let model = if crate::stack::uses_stack(&settings.model) {
+            crate::stack::orchestrator_model(stuck).to_string()
+        } else {
+            settings.model.clone()
+        };
+        let mut turn_messages = messages.clone();
+        if crate::stack::uses_stack(&settings.model) {
+            let page = if next_dom {
+                last_browser_text(&messages)
+            } else {
+                String::new()
+            };
+            let shot = if next_vision {
+                last_image(&messages)
+            } else {
+                None
+            };
+            let app_status = app.clone();
+            let briefing = crate::stack::brief(
+                &settings,
+                &goal,
+                &page,
+                shot.as_deref(),
+                cancel,
+                |text| emit(&app_status, AgentEvent::Status { text: text.to_string() }),
+            )
+            .await;
+            if !briefing.is_empty() {
+                turn_messages.push(ChatMessage::text("user", briefing));
+            }
+        }
+        next_vision = false;
+        next_dom = false;
         emit(
             &app,
             AgentEvent::Status {
                 text: format!(
                     "Step {} of {max_steps} · {}",
                     step + 1,
-                    if settings.think { "Gemma is thinking…" } else { "Gemma is working…" }
+                    if crate::stack::uses_stack(&settings.model) {
+                        if stuck {
+                            "Gemini 4 Argon is taking over…"
+                        } else {
+                            "Gemini 3.5 Flash is orchestrating…"
+                        }
+                    } else if settings.think {
+                        "Gemma is thinking…"
+                    } else {
+                        "Gemma is working…"
+                    }
                 ),
             },
         );
@@ -165,7 +221,7 @@ pub async fn run(
         let turn = ollama::chat(
             &settings.api_key,
             &settings.gemma_api_key,
-            &settings.model,
+            &model,
             settings.think,
             &messages,
             &tools,
@@ -410,6 +466,13 @@ pub async fn run(
                 tool_calls: None,
                 tool_name: Some(name),
             });
+        }
+
+        if look_again {
+            next_vision = true;
+            next_dom = true;
+        } else if scan_whole {
+            next_dom = true;
         }
 
         if let Some(text) = observed {
@@ -812,6 +875,28 @@ How to work:
 - Only stop early for things you cannot do yourself: a login with credentials you do not have, a CAPTCHA, two-factor codes, or missing personal information. Then call task_done and explain exactly what the user needs to do.
 - Never pay, buy, delete accounts, or send messages to other people unless the user's request explicitly asks for that exact action.
 - Messages that start with [browser] are automatic page updates, not the user."#;
+
+const STACK_PROMPT: &str = r#"You are the cloud orchestrator in a Pure Google stack. Gemini 3.5 Flash handles tool calls. Gemini 4 Argon is used only when you are stuck. Local Ollama specialists may attach a [google-stack] note from PaliGemma 2 Mix (vision/OCR/coordinates), Gemma 3 4B (DOM/history), and Gemma 3 1B (ready/route). Trust [browser] indexes first. Use specialist coordinates only when no index exists."#;
+
+fn last_browser_text(messages: &[ChatMessage]) -> String {
+    for message in messages.iter().rev() {
+        if message.content.contains(OBSERVATION_TAG) || message.content.contains("FULL PAGE SCAN") {
+            return message.content.clone();
+        }
+    }
+    messages.last().map(|message| message.content.clone()).unwrap_or_default()
+}
+
+fn last_image(messages: &[ChatMessage]) -> Option<String> {
+    for message in messages.iter().rev() {
+        if let Some(images) = &message.images {
+            if let Some(image) = images.last().filter(|image| !image.is_empty()) {
+                return Some(image.clone());
+            }
+        }
+    }
+    None
+}
 
 #[cfg(test)]
 mod tests {
