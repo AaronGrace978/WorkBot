@@ -68,4 +68,4 @@ Local specialists are optional. If Ollama is offline, Flash still drives the bro
 
 Use a Google AI Studio key for Pure Google and Cloud Google models, or an [Ollama Cloud](https://ollama.com/settings/keys) key for hosted Ollama Gemma models.
 
-Inspired by GrokBot. Built with Gemma. Not an official Google product. Gemma is a trademark of Google LLC. This independent project is not affiliated with or endorsed by Google or xAI.
+Google-inspired. Built with Gemma. Not an official Google product. Gemma is a trademark of Google LLC. This independent project is not affiliated with or endorsed by Google.
