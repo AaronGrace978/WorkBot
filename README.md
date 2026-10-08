@@ -1,6 +1,18 @@
 # Gemma Work Bot
 
-A Google Gemma inspired WorkBot that gets your browser work done. Built with Tauri 2, React, Rust, Ollama Cloud, and Chrome DevTools Protocol.
+<p align="center">
+  <img src="docs/readme-hero.jpg" alt="Gemma Work Bot — autonomous browser agent built with TypeScript, React, CSS, Rust, and Tauri" width="100%" />
+</p>
+
+<p align="center">
+  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white" />
+  <img alt="React" src="https://img.shields.io/badge/React-61DAFB?style=for-the-badge&logo=react&logoColor=000" />
+  <img alt="CSS" src="https://img.shields.io/badge/CSS-1572B6?style=for-the-badge&logo=css&logoColor=white" />
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-DEA584?style=for-the-badge&logo=rust&logoColor=000" />
+  <img alt="Tauri" src="https://img.shields.io/badge/Tauri-24C8DB?style=for-the-badge&logo=tauri&logoColor=white" />
+</p>
+
+A Google Gemma inspired WorkBot that gets your browser work done. Built with Tauri 2, React, TypeScript, CSS, and Rust, talking to Ollama Cloud or the Google Gemma API through Chrome DevTools Protocol.
 
 ## Features
 
