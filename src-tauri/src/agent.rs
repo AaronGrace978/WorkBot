@@ -1,8 +1,11 @@
 use crate::browser::Browser;
+use crate::memory::{extract_domain, MemoryItem, MemoryVault};
 use crate::ollama::{self, arg_bool, arg_f64, arg_i64, arg_string, ChatMessage, ToolCall, ToolFunction};
 use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -16,26 +19,60 @@ pub struct HistoryTurn {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanStep {
+    pub title: String,
+    /// "pending" | "in_progress" | "done"
+    pub status: String,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AgentEvent {
-    Status { text: String },
-    Thinking { text: String },
-    Content { text: String },
-    ToolStart { name: String, args: String },
+    Status {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
+    Content {
+        text: String,
+    },
+    ToolStart {
+        name: String,
+        args: String,
+    },
     ToolEnd {
         name: String,
         result: String,
         image: Option<String>,
     },
+    Plan {
+        steps: Vec<PlanStep>,
+    },
+    Learned {
+        item: MemoryItem,
+    },
+    Telemetry {
+        step: u32,
+        max_steps: u32,
+        active_model: String,
+        domain: String,
+        memories_applied: Vec<String>,
+    },
     Done,
-    Error { text: String },
+    Error {
+        text: String,
+    },
 }
 
 pub async fn run(
     app: AppHandle,
     settings: Settings,
     browser: &Mutex<Browser>,
+    memory: &Mutex<MemoryVault>,
+    memory_path: &Path,
     cancel: &AtomicBool,
     message: String,
     images: Vec<String>,
@@ -101,14 +138,17 @@ pub async fn run(
     } else {
         message
     };
+    let mut current_url: Option<String> = None;
     if connected {
         emit(&app, AgentEvent::Status { text: "Scanning the whole Chrome page…".into() });
         let initial_observation = {
             let mut guard = browser.lock().await;
-            match guard.scan_whole_page().await {
+            let res = match guard.scan_whole_page().await {
                 Ok(observation) => Ok(observation),
                 Err(_) => guard.observe().await,
-            }
+            };
+            current_url = guard.current_url();
+            res
         };
         match initial_observation {
             Ok(obs) => {
@@ -129,9 +169,27 @@ pub async fn run(
         }
     } else {
         user_text.push_str(&format!(
-            "\n\n{OBSERVATION_TAG}\nChrome is not attached, so browser tools will fail. Answer from what you know and any attached images, then call task_done. If the task needs the browser, tell the user to press Control my Chrome."
+            "\n\n{OBSERVATION_TAG}\nChrome is not attached, so browser tools will fail. Answer from what you know and any attached images, then call task_done. If the task needs the browser, tell the user to press Start bot Chrome."
         ));
     }
+
+    // Inject learned domain playbooks, pitfalls, and user preferences
+    let mut recalled_domains = HashSet::new();
+    let initial_domain = current_url
+        .as_deref()
+        .map(extract_domain)
+        .unwrap_or_else(|| "*".into());
+    recalled_domains.insert(initial_domain.clone());
+
+    let applied_memories = {
+        let mut vault = memory.lock().await;
+        let (memory_block, applied) = vault.recall_for_context(&goal, current_url.as_deref());
+        if !memory_block.is_empty() {
+            user_text = format!("{user_text}\n\n{memory_block}");
+            let _ = vault.save(memory_path);
+        }
+        applied
+    };
 
     let task_message_index = messages.len();
     let mut user = ChatMessage::text("user", user_text);
@@ -148,9 +206,12 @@ pub async fn run(
     let mut last_action = String::new();
     let mut repeats = 0u32;
     let mut error_streak = 0u32;
+    let mut had_recovery = false;
     let mut reviewed_since_change = false;
     let mut next_vision = true;
     let mut next_dom = true;
+    let mut action_trace: Vec<String> = Vec::new();
+    let mut active_memories = applied_memories;
 
     for step in 0..max_steps {
         if cancel.load(Ordering::SeqCst) {
@@ -163,11 +224,35 @@ pub async fn run(
             step == 0,
         );
         let stuck = error_streak >= 2 || repeats >= 2;
+        if stuck {
+            had_recovery = true;
+        }
         let model = if crate::stack::uses_stack(&settings.model) {
-            crate::stack::orchestrator_model(stuck).to_string()
+            crate::stack::select_orchestrator(&settings.model, stuck).to_string()
         } else {
             settings.model.clone()
         };
+
+        let active_domain = {
+            let guard = browser.lock().await;
+            guard
+                .current_url()
+                .as_deref()
+                .map(extract_domain)
+                .unwrap_or_else(|| "*".into())
+        };
+
+        emit(
+            &app,
+            AgentEvent::Telemetry {
+                step: step + 1,
+                max_steps,
+                active_model: model.clone(),
+                domain: active_domain.clone(),
+                memories_applied: active_memories.clone(),
+            },
+        );
+
         let mut turn_messages = messages.clone();
         if crate::stack::uses_stack(&settings.model) {
             let page = if next_dom {
@@ -203,8 +288,12 @@ pub async fn run(
                     "Step {} of {max_steps} · {}",
                     step + 1,
                     if crate::stack::uses_stack(&settings.model) {
-                        if stuck {
-                            "Gemini 4 Argon is taking over…"
+                        if model == crate::stack::ARGON_MODEL {
+                            if stuck {
+                                "Gemini 4 Argon is resolving obstacle…"
+                            } else {
+                                "Gemini 4 Argon is orchestrating…"
+                            }
                         } else {
                             "Gemini 3.5 Flash is orchestrating…"
                         }
@@ -223,7 +312,7 @@ pub async fn run(
             &settings.gemma_api_key,
             &model,
             settings.think,
-            &messages,
+            &turn_messages,
             &tools,
             |thinking, content| {
                 if !thinking.is_empty() {
@@ -292,7 +381,7 @@ pub async fn run(
         let mut outcomes = Vec::new();
         let mut look_again = false;
         let mut scan_whole = false;
-        let mut finished: Option<String> = None;
+        let mut finished: Option<(String, Option<String>)> = None;
         for call in &calls {
             if cancel.load(Ordering::SeqCst) {
                 break;
@@ -300,8 +389,9 @@ pub async fn run(
             let name = call.function.name.trim().to_string();
             if name == "task_done" {
                 let summary = arg_string(&call.function.arguments, "summary").unwrap_or_default();
+                let lesson = arg_string(&call.function.arguments, "lesson");
                 outcomes.push((name, "Task marked done.".to_string()));
-                finished = Some(summary);
+                finished = Some((summary, lesson));
                 break;
             }
             let args_text = call.function.arguments.to_string();
@@ -323,8 +413,11 @@ pub async fn run(
                 "browser_scan"
                     | "browser_navigate"
                     | "browser_back"
+                    | "browser_forward"
+                    | "browser_reload"
                     | "browser_switch_tab"
                     | "browser_new_tab"
+                    | "browser_close_tab"
             ) {
                 scan_whole = true;
             }
@@ -359,13 +452,22 @@ pub async fn run(
                 sleep_cancellable(Duration::from_secs_f64(secs), cancel).await;
                 look_again = true;
                 Ok(format!("Waited {secs:.1} seconds."))
+            } else if name == "plan_update" {
+                handle_plan_update(&app, &call.function.arguments)
+            } else if name == "memory_save" {
+                handle_memory_save(&app, memory, memory_path, browser, &call.function.arguments).await
+            } else if name == "memory_search" {
+                handle_memory_search(memory, browser, &call.function.arguments).await
             } else {
                 dispatch(browser, call).await
             };
-            if result.is_ok() {
+            if let Ok(ref ok_text) = result {
+                if name.starts_with("browser_") && name != "browser_look" && name != "browser_scan" {
+                    action_trace.push(format!("{name} ({})", truncate(ok_text, 64)));
+                }
                 if name == "browser_review" {
                     reviewed_since_change = true;
-                } else if matches!(name.as_str(), "browser_type" | "browser_select")
+                } else if matches!(name.as_str(), "browser_type" | "browser_select" | "browser_drag")
                     || (name == "browser_click" && !is_final_action)
                 {
                     reviewed_since_change = false;
@@ -390,7 +492,7 @@ pub async fn run(
             outcomes.push((name, text));
         }
 
-        if let Some(summary) = finished {
+        if let Some((summary, explicit_lesson)) = finished {
             for (name, result) in outcomes.iter().filter(|(n, _)| n != "task_done") {
                 emit(
                     &app,
@@ -400,6 +502,23 @@ pub async fn run(
                         image: None,
                     },
                 );
+            }
+            if settings.auto_learn {
+                let final_url = browser.lock().await.current_url();
+                let mut vault = memory.lock().await;
+                if let Some(learned) = vault.record_run_outcome(
+                    &goal,
+                    final_url.as_deref(),
+                    &summary,
+                    explicit_lesson.as_deref(),
+                    &action_trace,
+                    had_recovery,
+                ) {
+                    let _ = vault.save(memory_path);
+                    emit(&app, AgentEvent::Learned { item: learned });
+                } else {
+                    let _ = vault.save(memory_path);
+                }
             }
             if turn.content.trim().is_empty() && !summary.trim().is_empty() {
                 let prefix = if spoke { "\n\n" } else { "" };
@@ -416,6 +535,7 @@ pub async fn run(
 
         let mut shot: Option<String> = None;
         let mut observed = None;
+        let mut new_domain_memory = String::new();
         if look_again {
             emit(
                 &app,
@@ -427,23 +547,41 @@ pub async fn run(
                     },
                 },
             );
-            let observation = {
+            let (observation, updated_url) = {
                 let mut guard = browser.lock().await;
-                if scan_whole {
+                let res = if scan_whole {
                     match guard.scan_whole_page().await {
                         Ok(observation) => Ok(observation),
                         Err(_) => guard.observe().await,
                     }
                 } else {
                     guard.observe().await
-                }
+                };
+                (res, guard.current_url())
             };
+            if let Some(ref u) = updated_url {
+                let dom = extract_domain(u);
+                if dom != "*" && !recalled_domains.contains(&dom) {
+                    recalled_domains.insert(dom);
+                    let mut vault = memory.lock().await;
+                    let (block, applied) = vault.recall_for_context(&goal, Some(u));
+                    if !block.is_empty() {
+                        new_domain_memory = format!("\n\n{block}");
+                        for title in applied {
+                            if !active_memories.contains(&title) {
+                                active_memories.push(title);
+                            }
+                        }
+                        let _ = vault.save(memory_path);
+                    }
+                }
+            }
             match observation {
                 Ok(obs) => {
                     shot = Some(obs.jpeg_b64);
-                    observed = Some(obs.text);
+                    observed = Some(format!("{}{new_domain_memory}", obs.text));
                 }
-                Err(err) => observed = Some(format!("Could not take a screenshot: {err}")),
+                Err(err) => observed = Some(format!("Could not take a screenshot: {err}{new_domain_memory}")),
             }
         }
 
@@ -513,6 +651,99 @@ async fn sleep_cancellable(total: Duration, cancel: &AtomicBool) {
     }
 }
 
+fn handle_plan_update(app: &AppHandle, args: &Value) -> Result<String, String> {
+    let Some(items) = args.get("steps").and_then(Value::as_array) else {
+        return Err("plan_update requires a steps array.".into());
+    };
+    let mut steps = Vec::new();
+    for item in items.iter().take(12) {
+        let title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let status = match item.get("status").and_then(Value::as_str).unwrap_or("pending") {
+            "done" | "completed" => "done",
+            "in_progress" | "active" | "running" => "in_progress",
+            _ => "pending",
+        }
+        .to_string();
+        steps.push(PlanStep { title, status });
+    }
+    let done_count = steps.iter().filter(|s| s.status == "done").count();
+    let total = steps.len();
+    emit(app, AgentEvent::Plan { steps });
+    Ok(format!("Updated mission plan ({done_count}/{total} checkpoints complete)."))
+}
+
+async fn handle_memory_save(
+    app: &AppHandle,
+    memory: &Mutex<MemoryVault>,
+    memory_path: &Path,
+    browser: &Mutex<Browser>,
+    args: &Value,
+) -> Result<String, String> {
+    let title = arg_string(args, "title").ok_or("memory_save needs a title.")?;
+    let content = arg_string(args, "content").ok_or("memory_save needs content.")?;
+    let kind = arg_string(args, "kind").unwrap_or_else(|| "playbook".into());
+    let current_domain = browser
+        .lock()
+        .await
+        .current_url()
+        .as_deref()
+        .map(extract_domain)
+        .unwrap_or_else(|| "*".into());
+    let domain = arg_string(args, "domain").unwrap_or(current_domain);
+    let tags = args
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut vault = memory.lock().await;
+    let item = vault.upsert(&kind, &domain, &title, &content, tags, "agent");
+    vault.save(memory_path)?;
+    emit(app, AgentEvent::Learned { item: item.clone() });
+    Ok(format!(
+        "Saved {} memory \"{}\" for domain {}.",
+        item.kind, item.title, item.domain
+    ))
+}
+
+async fn handle_memory_search(
+    memory: &Mutex<MemoryVault>,
+    browser: &Mutex<Browser>,
+    args: &Value,
+) -> Result<String, String> {
+    let query = arg_string(args, "query").unwrap_or_default();
+    let current_domain = browser
+        .lock()
+        .await
+        .current_url()
+        .as_deref()
+        .map(extract_domain);
+    let domain = arg_string(args, "domain").or(current_domain);
+    let vault = memory.lock().await;
+    let matches = vault.search(&query, domain.as_deref());
+    if matches.is_empty() {
+        return Ok("No matching memories found in the vault.".into());
+    }
+    let lines: Vec<String> = matches
+        .into_iter()
+        .map(|m| format!("[{} | {}] {}: {}", m.kind, m.domain, m.title, m.content))
+        .collect();
+    Ok(lines.join("\n"))
+}
+
 async fn dispatch(browser: &Mutex<Browser>, call: &ToolCall) -> Result<String, String> {
     let args = &call.function.arguments;
     let mut guard = browser.lock().await;
@@ -543,9 +774,25 @@ async fn dispatch(browser: &Mutex<Browser>, call: &ToolCall) -> Result<String, S
             let key = arg_string(args, "key").ok_or("browser_press needs a key.")?;
             guard.press(&key).await
         }
+        "browser_key_combo" => {
+            let combo = arg_string(args, "combo").ok_or("browser_key_combo needs a combo like Control+A.")?;
+            guard.key_combo(&combo).await
+        }
         "browser_hover" => {
             guard
                 .hover(arg_i64(args, "index"), arg_f64(args, "x"), arg_f64(args, "y"))
+                .await
+        }
+        "browser_drag" => {
+            guard
+                .drag(
+                    arg_i64(args, "from_index"),
+                    arg_f64(args, "from_x"),
+                    arg_f64(args, "from_y"),
+                    arg_i64(args, "to_index"),
+                    arg_f64(args, "to_x"),
+                    arg_f64(args, "to_y"),
+                )
                 .await
         }
         "browser_scroll" => {
@@ -558,6 +805,8 @@ async fn dispatch(browser: &Mutex<Browser>, call: &ToolCall) -> Result<String, S
             guard.navigate(&url).await
         }
         "browser_back" => guard.back().await,
+        "browser_forward" => guard.forward().await,
+        "browser_reload" => guard.reload().await,
         "browser_select" => {
             let index = arg_i64(args, "index").ok_or("browser_select needs an index.")?;
             let label = arg_string(args, "label")
@@ -568,6 +817,11 @@ async fn dispatch(browser: &Mutex<Browser>, call: &ToolCall) -> Result<String, S
         "browser_read" => {
             let max = arg_i64(args, "max_chars").unwrap_or(6000).clamp(500, 20000) as usize;
             guard.read_text(max).await
+        }
+        "browser_extract" => {
+            let kind = arg_string(args, "kind").unwrap_or_else(|| "all".into());
+            let selector = arg_string(args, "selector");
+            guard.extract_structured(&kind, selector.as_deref()).await
         }
         "browser_review" => guard.review_form().await,
         "browser_tabs" => guard.tabs_text().await,
@@ -582,6 +836,10 @@ async fn dispatch(browser: &Mutex<Browser>, call: &ToolCall) -> Result<String, S
             let url = arg_string(args, "url").unwrap_or_default();
             guard.new_tab(&url).await
         }
+        "browser_close_tab" => {
+            let index = arg_i64(args, "index").filter(|i| *i >= 0).map(|i| i as usize);
+            guard.close_tab(index).await
+        }
         other => Err(format!("Unknown tool {other}. Use one of the listed tools.")),
     }
 }
@@ -594,14 +852,19 @@ fn changes_page(name: &str) -> bool {
             | "browser_click"
             | "browser_type"
             | "browser_press"
+            | "browser_key_combo"
             | "browser_hover"
+            | "browser_drag"
             | "browser_scroll"
             | "browser_navigate"
             | "browser_back"
+            | "browser_forward"
+            | "browser_reload"
             | "browser_select"
             | "browser_review"
             | "browser_switch_tab"
             | "browser_new_tab"
+            | "browser_close_tab"
     )
 }
 
@@ -611,16 +874,25 @@ const KNOWN_TOOLS: &[&str] = &[
     "browser_click",
     "browser_type",
     "browser_press",
+    "browser_key_combo",
     "browser_hover",
+    "browser_drag",
     "browser_scroll",
     "browser_navigate",
     "browser_back",
+    "browser_forward",
+    "browser_reload",
     "browser_select",
     "browser_read",
+    "browser_extract",
     "browser_review",
     "browser_tabs",
     "browser_switch_tab",
     "browser_new_tab",
+    "browser_close_tab",
+    "plan_update",
+    "memory_save",
+    "memory_search",
     "wait",
     "task_done",
 ];
@@ -794,9 +1066,25 @@ fn tool_schema() -> Value {
             "required":["key"],
             "properties":{"key":{"type":"string"}}
         })),
+        tool("browser_key_combo", "Press a keyboard shortcut such as Control+A, Control+C, Control+V, Control+Enter, or Shift+Tab.", json!({
+            "type":"object",
+            "required":["combo"],
+            "properties":{"combo":{"type":"string","description":"Modifier+Key chord, e.g. Control+A or Shift+Tab"}}
+        })),
         tool("browser_hover", "Move the pointer over an element or screenshot point without clicking.", json!({
             "type":"object",
             "properties":{"index":{"type":"integer"},"x":{"type":"number"},"y":{"type":"number"}}
+        })),
+        tool("browser_drag", "Drag from an element or point to another element or point (sliders, kanban cards, sortable lists).", json!({
+            "type":"object",
+            "properties":{
+                "from_index":{"type":"integer"},
+                "from_x":{"type":"number"},
+                "from_y":{"type":"number"},
+                "to_index":{"type":"integer"},
+                "to_x":{"type":"number"},
+                "to_y":{"type":"number"}
+            }
         })),
         tool("browser_scroll", "Scroll the page. Positive dy scrolls down.", json!({
             "type":"object",
@@ -808,6 +1096,8 @@ fn tool_schema() -> Value {
             "properties":{"url":{"type":"string"}}
         })),
         tool("browser_back", "Go back in the tab history.", json!({"type":"object","properties":{}})),
+        tool("browser_forward", "Go forward in the tab history.", json!({"type":"object","properties":{}})),
+        tool("browser_reload", "Reload the current page.", json!({"type":"object","properties":{}})),
         tool("browser_select", "Choose an option in a select element by visible label or value.", json!({
             "type":"object",
             "required":["index","label"],
@@ -816,6 +1106,13 @@ fn tool_schema() -> Value {
         tool("browser_read", "Read the full text of the current page, including parts below the screen. Use it to find answers or data on long pages.", json!({
             "type":"object",
             "properties":{"max_chars":{"type":"integer"}}
+        })),
+        tool("browser_extract", "Extract structured data from the page (tables, headings, links, lists, or CSS selector matches) as JSON.", json!({
+            "type":"object",
+            "properties":{
+                "kind":{"type":"string","enum":["all","tables","headings","links","lists","selector"]},
+                "selector":{"type":"string","description":"Optional CSS selector to scope extraction"}
+            }
         })),
         tool("browser_review", "Required immediately before Submit, Send, Save, Confirm, Publish, payment, or any other final action. Read every current form value and final-action label, then compare them with the user's original prompt and reference images. Correct mismatches before the final click.", json!({
             "type":"object",
@@ -831,6 +1128,45 @@ fn tool_schema() -> Value {
             "type":"object",
             "properties":{"url":{"type":"string"}}
         })),
+        tool("browser_close_tab", "Close a Chrome tab by index (or the active tab if omitted).", json!({
+            "type":"object",
+            "properties":{"index":{"type":"integer"}}
+        })),
+        tool("plan_update", "Create or update your step-by-step execution checklist for multi-stage tasks so progress is tracked clearly.", json!({
+            "type":"object",
+            "required":["steps"],
+            "properties":{
+                "steps":{
+                    "type":"array",
+                    "items":{
+                        "type":"object",
+                        "required":["title","status"],
+                        "properties":{
+                            "title":{"type":"string"},
+                            "status":{"type":"string","enum":["pending","in_progress","done"]}
+                        }
+                    }
+                }
+            }
+        })),
+        tool("memory_save", "Save a reusable lesson, site workflow playbook, pitfall workaround, or user preference into persistent memory so WorkBot remembers and develops over time.", json!({
+            "type":"object",
+            "required":["title","content"],
+            "properties":{
+                "kind":{"type":"string","enum":["playbook","pitfall","preference","skill"]},
+                "domain":{"type":"string","description":"Website domain like github.com, or * for global"},
+                "title":{"type":"string"},
+                "content":{"type":"string","description":"Specific actionable workflow, selector hint, workaround, or preference"},
+                "tags":{"type":"array","items":{"type":"string"}}
+            }
+        })),
+        tool("memory_search", "Search persistent memory for learned site playbooks, pitfalls, or user preferences.", json!({
+            "type":"object",
+            "properties":{
+                "query":{"type":"string"},
+                "domain":{"type":"string"}
+            }
+        })),
         tool("wait", "Wait for a page to finish loading or an animation to end, then look again.", json!({
             "type":"object",
             "properties":{"seconds":{"type":"number"}}
@@ -838,7 +1174,10 @@ fn tool_schema() -> Value {
         tool("task_done", "Call this once the whole task is finished, or if it truly cannot be done. The summary is shown to the user.", json!({
             "type":"object",
             "required":["summary"],
-            "properties":{"summary":{"type":"string","description":"What you did and the result, or why it could not be done"}}
+            "properties":{
+                "summary":{"type":"string","description":"What you did and the result, or why it could not be done"},
+                "lesson":{"type":"string","description":"Optional: a reusable site lesson, selector tip, or workflow insight learned during this run to store in persistent memory"}
+            }
         }))
     ])
 }
@@ -854,29 +1193,31 @@ fn tool(name: &str, description: &str, parameters: Value) -> Value {
     })
 }
 
-const SYSTEM_PROMPT: &str = r#"You are Gemma Work Bot, an autonomous agent that controls the user's own Google Chrome and finishes tasks end to end without asking for help.
+const SYSTEM_PROMPT: &str = r#"You are Gemma Work Bot, an autonomous agent with ARGON-standard harnessing that controls the user's dedicated Google Chrome and finishes tasks end to end without asking for help.
 
-You can see. Each [browser] message has a high-detail screenshot of the current tab, a numbered list of clickable elements, and visible page text. Gold number badges in the image match the indexes. Original reference images remain available throughout the task.
+You can see, plan, and learn. Each [browser] message has a high-detail screenshot of the current tab, a numbered list of clickable elements (including inside open Shadow DOM), and visible page text. Gold number badges in the image match the indexes. Original reference images remain available throughout the task. Learned domain playbooks and user preferences appear in [memory-vault].
 
 How to work:
 - Work on your own until the task is completely done. Never stop to ask "should I continue?" or wait for confirmation. Pick sensible defaults and keep going.
+- For multi-step tasks, call plan_update early to outline 2-6 clear checkpoints and update them as you progress.
 - Before the first action on any new page, study the entire FULL PAGE SCAN from top to bottom. Understand the page's purpose, sections, forms, off-screen controls, and final actions before clicking anything. Navigation automatically produces a new full-page scan; call browser_scan again whenever the layout or task state is unclear.
+- Apply any [memory-vault] playbooks, pitfalls, and preferences for the current domain. When you discover a non-obvious site workflow, overcome a tricky UI obstacle, or learn a user preference, call memory_save (or pass a `lesson` in task_done) so you permanently improve on future runs.
 - Do not click merely because an element looks plausible. First connect the action to the user's original goal and explain it in your private reasoning.
 - Read the user's entire original prompt before planning. Inspect attached/reference images carefully: compare text, layout, colors, counts, selections, and other visible details instead of making a quick guess.
 - Think about what is on screen, compare it to the original prompt and reference images, then act with a tool. Every reply should include a tool call until the task is finished.
 - Prefer browser_click with an index. Use x and y only when the target is not listed. Coordinates are screenshot pixels from the top left.
-- To fill a form, browser_type into each field (clear true to replace existing text) and use browser_select for dropdowns.
+- To fill a form, browser_type into each field (clear true to replace existing text) and use browser_select for dropdowns. Use browser_key_combo for shortcuts (like Control+A or Shift+Tab) and browser_extract for structured tables/links.
 - REQUIRED BEFORE FINAL ACTION: before clicking Submit, Send, Save, Confirm, Finish, Publish, Post, payment, or creating an account, call browser_review. Re-read the original user prompt, compare every reported field and the fresh screenshot against it, and correct every mismatch. Only then perform the final action. Final actions are blocked until this review occurs.
 - Do not use browser_type submit=true or press Enter to submit a final form before browser_review.
 - If the page is loading, call wait. If something is below the screen, scroll. To read a long page, call browser_read.
 - After each action you get a new screenshot. Trust it over your memory. If an action did nothing, try a different approach instead of repeating it.
 - Close cookie banners and popups that block the page.
-- When the whole task is finished, call task_done with a short summary of what you did and any answer the user asked for. Put the answer in the summary rather than writing it twice.
+- When the whole task is finished, call task_done with a short summary of what you did and any answer the user asked for, plus an optional `lesson` to remember for next time. Put the answer in the summary rather than writing it twice.
 - Only stop early for things you cannot do yourself: a login with credentials you do not have, a CAPTCHA, two-factor codes, or missing personal information. Then call task_done and explain exactly what the user needs to do.
 - Never pay, buy, delete accounts, or send messages to other people unless the user's request explicitly asks for that exact action.
 - Messages that start with [browser] are automatic page updates, not the user."#;
 
-const STACK_PROMPT: &str = r#"You are the cloud orchestrator in a Pure Google stack. Gemini 3.5 Flash handles tool calls. Gemini 4 Argon is used only when you are stuck. Local Ollama specialists may attach a [google-stack] note from PaliGemma 2 Mix (vision/OCR/coordinates), Gemma 3 4B (DOM/history), and Gemma 3 1B (ready/route). Trust [browser] indexes first. Use specialist coordinates only when no index exists."#;
+const STACK_PROMPT: &str = r#"You are the cloud orchestrator in a Pure Google stack. Gemini 3.5 Flash handles rapid tool calls and Gemini 4 Argon handles deep reasoning, complex planning, and stuck-task recovery. Local Ollama specialists may attach a [google-stack] note from PaliGemma 2 Mix (vision/OCR/coordinates), Gemma 3 4B (DOM/history), and Gemma 3 1B (ready/route). Trust [browser] indexes first. Use specialist coordinates only when no index exists."#;
 
 fn last_browser_text(messages: &[ChatMessage]) -> String {
     for message in messages.iter().rev() {

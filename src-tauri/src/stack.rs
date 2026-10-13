@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 pub const STACK_MODEL: &str = "google-stack";
+pub const ARGON_STACK_MODEL: &str = "argon-stack";
 pub const VISION_MODEL: &str = "paligemma2:3b";
 pub const DOM_MODEL: &str = "gemma3:4b";
 pub const ROUTER_MODEL: &str = "gemma3:1b";
@@ -11,7 +12,7 @@ pub const FLASH_MODEL: &str = "gemini-3.5-flash";
 pub const ARGON_MODEL: &str = "gemini-4-argon";
 
 pub fn uses_stack(model: &str) -> bool {
-    matches!(model.trim(), STACK_MODEL | "pure-google")
+    matches!(model.trim(), STACK_MODEL | ARGON_STACK_MODEL | "pure-google")
 }
 
 pub fn orchestrator_model(stuck: bool) -> &'static str {
@@ -19,6 +20,14 @@ pub fn orchestrator_model(stuck: bool) -> &'static str {
         ARGON_MODEL
     } else {
         FLASH_MODEL
+    }
+}
+
+pub fn select_orchestrator(model: &str, stuck: bool) -> &'static str {
+    if model.trim() == ARGON_STACK_MODEL {
+        ARGON_MODEL
+    } else {
+        orchestrator_model(stuck)
     }
 }
 
@@ -150,8 +159,10 @@ mod tests {
     #[test]
     fn recognizes_stack_id() {
         assert!(uses_stack("google-stack"));
+        assert!(uses_stack("argon-stack"));
         assert!(!uses_stack("gemma-4-31b-it"));
         assert_eq!(orchestrator_model(false), FLASH_MODEL);
         assert_eq!(orchestrator_model(true), ARGON_MODEL);
+        assert_eq!(select_orchestrator("argon-stack", false), ARGON_MODEL);
     }
 }

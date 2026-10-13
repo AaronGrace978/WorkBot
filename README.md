@@ -19,13 +19,14 @@ Gemma is a trademark of Google LLC.
 
 ## Features
 
-- Full-page visual scan before acting
-- Chrome clicking, typing, scrolling, forms, tabs, and navigation
-- Reference-image comparison with high-detail screenshots
-- Mandatory field review before Submit, Send, Save, Confirm, or payment
-- Autonomous task loop with a 777-step ceiling
-- Persistent isolated Chrome profile that remembers website sessions
-- Windows, Linux x64/ARM64, macOS Apple Silicon/Intel, and Chromebook-via-Linux builds
+- **ARGON-Standard Autonomous Harnessing** — Dual Pure Google stack modes (*All-Google Stack* with Flash + Argon escalation, or *Argon Apex Stack* with Gemini 4 Argon primary orchestration)
+- **Continuous Self-Learning & Memory Vault** — Automatically learns and persists domain-specific site playbooks, UI pitfall workarounds, user preferences, and 1-click reusable skills (`memory_save`, `memory_search`, trajectory reflection, and automatic `[memory-vault]` recall)
+- **Full-Page + Open Shadow DOM Visual Scan** — Traverses both light DOM and open Shadow DOM roots before acting
+- **Rich Browser Tooling** — Clicking, typing, keyboard chords (`browser_key_combo`), drag-and-drop (`browser_drag`), structured table/link/heading extraction (`browser_extract`), forms, tabs, and navigation
+- **Live Mission Checkpoints & Telemetry HUD** — Real-time step progress, active specialist indicator, and `plan_update` checklists
+- **Mandatory Pre-Submit Field Verification** — `browser_review` audits every field before Submit, Send, Save, Confirm, or payment
+- **Google Daylight & Gemini Argon Dark Themes** — One-click theme switching with persistent isolated Chrome profile (777-step ceiling)
+- **All-Platform Releases** — Windows, Linux x64/ARM64, macOS Apple Silicon/Intel, and Chromebook-via-Linux builds
 
 ## Install
 

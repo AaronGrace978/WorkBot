@@ -14,6 +14,10 @@ pub struct Settings {
     pub think: bool,
     pub debug_port: u16,
     pub max_steps: u32,
+    #[serde(default = "default_auto_learn")]
+    pub auto_learn: bool,
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -26,6 +30,8 @@ impl Default for Settings {
             think: false,
             debug_port: 9222,
             max_steps: 777,
+            auto_learn: true,
+            theme: default_theme(),
         }
     }
 }
@@ -68,11 +74,26 @@ impl Settings {
             self.think = false;
             self.max_steps = 777;
         }
-        self.max_steps = 777;
+        if self.max_steps == 0 {
+            self.max_steps = 777;
+        }
+        self.max_steps = self.max_steps.clamp(1, 777);
+        self.theme = match self.theme.trim().to_lowercase().as_str() {
+            "dark" | "argon" => "dark".into(),
+            _ => "light".into(),
+        };
         self
     }
 }
 
 fn default_ollama_host() -> String {
     "http://127.0.0.1:11434".into()
+}
+
+fn default_auto_learn() -> bool {
+    true
+}
+
+fn default_theme() -> String {
+    "light".into()
 }

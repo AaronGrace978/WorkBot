@@ -4,8 +4,13 @@ description = "Commands used by Gemma Work Bot"
 commands.allow = [
   "get_settings",
   "save_settings",
+  "get_memories",
+  "save_memory",
+  "delete_memory",
+  "clear_learned_memories",
   "browser_status",
   "launch_chrome",
+  "browser_quick_action",
   "run_agent",
   "stop_agent"
 ]

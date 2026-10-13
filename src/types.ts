@@ -6,6 +6,8 @@ export type Settings = {
   think: boolean;
   debugPort: number;
   maxSteps: number;
+  autoLearn: boolean;
+  theme: string;
 };
 
 export type TabInfo = {
@@ -31,6 +33,49 @@ export type ToolTrace = {
   image?: string;
 };
 
+export type PlanStep = {
+  title: string;
+  status: "pending" | "in_progress" | "done" | string;
+};
+
+export type MemoryItem = {
+  id: string;
+  kind: "playbook" | "pitfall" | "preference" | "skill" | string;
+  domain: string;
+  title: string;
+  content: string;
+  tags: string[];
+  uses: number;
+  confidence: number;
+  source: string;
+  updatedAt: number;
+};
+
+export type MemoryStats = {
+  totalMemories: number;
+  playbooksCount: number;
+  pitfallsCount: number;
+  preferencesCount: number;
+  skillsCount: number;
+  domainsLearned: number;
+  totalApplications: number;
+  tasksCompleted: number;
+  selfHeals: number;
+};
+
+export type MemorySnapshot = {
+  items: MemoryItem[];
+  stats: MemoryStats;
+};
+
+export type TelemetryState = {
+  step: number;
+  maxSteps: number;
+  activeModel: string;
+  domain: string;
+  memoriesApplied: string[];
+};
+
 export type ChatMessage = {
   id: string;
   role: "user" | "assistant";
@@ -38,6 +83,8 @@ export type ChatMessage = {
   thinking?: string;
   images?: string[];
   tools: ToolTrace[];
+  plan?: PlanStep[];
+  learned?: MemoryItem[];
   pending?: boolean;
   status?: string;
   error?: string;
@@ -49,6 +96,16 @@ export type AgentEvent =
   | { type: "content"; text: string }
   | { type: "toolStart"; name: string; args: string }
   | { type: "toolEnd"; name: string; result: string; image?: string | null }
+  | { type: "plan"; steps: PlanStep[] }
+  | { type: "learned"; item: MemoryItem }
+  | {
+      type: "telemetry";
+      step: number;
+      maxSteps: number;
+      activeModel: string;
+      domain: string;
+      memoriesApplied: string[];
+    }
   | { type: "done" }
   | { type: "error"; text: string };
 
@@ -66,17 +123,20 @@ export const PROVIDERS: { id: ProviderId; label: string }[] = [
 ];
 
 export const STACK_ROLES = [
-  { tier: "Local Google", model: "PaliGemma 2 Mix 3B", role: "Visual scan, OCR, click coordinates" },
-  { tier: "Local Google", model: "Gemma 3 4B", role: "DOM ingest and 128k loop memory" },
-  { tier: "Local Google", model: "Gemma 3 1B", role: "Page-ready routing" },
-  { tier: "Cloud Google", model: "Gemini 3.5 Flash", role: "Tool orchestration" },
-  { tier: "Cloud Google", model: "Gemini 4 Argon", role: "Stuck-task fallback" },
+  { tier: "Local Google", model: "PaliGemma 2 Mix 3B", role: "Visual scan, OCR, click coordinates", id: "paligemma2:3b" },
+  { tier: "Local Google", model: "Gemma 3 4B", role: "DOM ingest and 128k loop memory", id: "gemma3:4b" },
+  { tier: "Local Google", model: "Gemma 3 1B", role: "Page-ready routing", id: "gemma3:1b" },
+  { tier: "Cloud Google", model: "Gemini 3.5 Flash", role: "Rapid tool orchestration", id: "gemini-3.5-flash" },
+  { tier: "Cloud Google", model: "Gemini 4 Argon", role: "Deep reasoning & obstacle recovery", id: "gemini-4-argon" },
 ];
 
 export const MODEL_GROUPS: { provider: ProviderId; models: ModelOption[] }[] = [
   {
     provider: "google-stack",
-    models: [{ id: "google-stack", label: "All-Google stack" }],
+    models: [
+      { id: "google-stack", label: "All-Google Stack (Flash + Argon)" },
+      { id: "argon-stack", label: "Argon Apex Stack (Argon Primary)" },
+    ],
   },
   {
     provider: "gemma",
@@ -107,12 +167,16 @@ export const MODEL_GROUPS: { provider: ProviderId; models: ModelOption[] }[] = [
   },
 ];
 
+export function isStackModel(model: string) {
+  return model === "google-stack" || model === "argon-stack" || model === "pure-google";
+}
+
 export function usesGemmaApi(model: string) {
-  return model === "google-stack" || model.startsWith("gemma-") || model.startsWith("gemini-");
+  return isStackModel(model) || model.startsWith("gemma-") || model.startsWith("gemini-");
 }
 
 export function providerFor(model: string): ProviderId {
-  if (model === "google-stack" || model === "pure-google") return "google-stack";
+  if (isStackModel(model)) return "google-stack";
   return usesGemmaApi(model) ? "gemma" : "ollama";
 }
 

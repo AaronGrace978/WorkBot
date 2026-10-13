@@ -222,6 +222,10 @@ impl Browser {
         }
     }
 
+    pub fn current_url(&self) -> Option<String> {
+        self.active_url.clone()
+    }
+
     pub async fn status(&self) -> BrowserStatus {
         let debug_open = self.port_open().await;
         let tabs = if debug_open {
@@ -435,7 +439,7 @@ impl Browser {
     ) -> Result<bool, String> {
         self.with_connection().await?;
         let target = if let Some(index) = index {
-            format!("document.querySelector('[data-wb=\"{index}\"]')")
+            format!("(window.__wb_get ? window.__wb_get({index}) : document.querySelector('[data-wb=\"{index}\"]'))")
         } else if let (Some(x), Some(y)) = (x, y) {
             let (cx, cy) = self.to_css(x, y);
             format!("document.elementFromPoint({cx}, {cy})")
@@ -563,7 +567,7 @@ impl Browser {
         let (cx, cy, label) = if let Some(index) = index {
             let point = self
                 .eval(&format!(
-                    "(function(){{const el=document.querySelector('[data-wb=\"{index}\"]');if(!el)return null;el.scrollIntoView({{block:'center',inline:'nearest'}});const r=el.getBoundingClientRect();el.focus();return {{x:r.left+r.width/2,y:r.top+r.height/2,label:(el.getAttribute('aria-label')||el.innerText||el.getAttribute('placeholder')||'').replace(/\\s+/g,' ').trim().slice(0,80)}};}})()"
+                    "(function(){{const el=(window.__wb_get?window.__wb_get({index}):null)||document.querySelector('[data-wb=\"{index}\"]');if(!el)return null;el.scrollIntoView({{block:'center',inline:'nearest'}});const r=el.getBoundingClientRect();el.focus();return {{x:r.left+r.width/2,y:r.top+r.height/2,label:(el.getAttribute('aria-label')||el.innerText||el.getAttribute('placeholder')||'').replace(/\\s+/g,' ').trim().slice(0,80)}};}})()"
                 ))
                 .await?;
             if point.is_null() {
@@ -596,7 +600,7 @@ impl Browser {
             return Err("That text is too long to type in one step.".into());
         }
         let focus = if let Some(index) = index {
-            format!("document.querySelector('[data-wb=\"{index}\"]')")
+            format!("((window.__wb_get?window.__wb_get({index}):null)||document.querySelector('[data-wb=\"{index}\"]'))")
         } else if let (Some(x), Some(y)) = (x, y) {
             let (cx, cy) = self.to_css(x, y);
             format!("document.elementFromPoint({cx}, {cy})")
@@ -702,12 +706,194 @@ impl Browser {
         Ok("Went back.".into())
     }
 
+    pub async fn forward(&mut self) -> Result<String, String> {
+        self.with_connection().await?;
+        let _ = self.eval("history.forward()").await?;
+        self.wait_for_load().await;
+        Ok("Went forward.".into())
+    }
+
+    pub async fn reload(&mut self) -> Result<String, String> {
+        self.with_connection().await?;
+        self.conn_call("Page.reload", json!({ "ignoreCache": false })).await?;
+        self.wait_for_load().await;
+        Ok("Reloaded the current tab.".into())
+    }
+
+    pub async fn key_combo(&mut self, combo: &str) -> Result<String, String> {
+        self.with_connection().await?;
+        let parts: Vec<&str> = combo
+            .split('+')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return Err("Pass a key combination such as Control+A or Shift+Tab.".into());
+        }
+        let mut modifiers = 0u32;
+        let mut main_key = "Enter";
+        for part in &parts {
+            match part.to_lowercase().as_str() {
+                "alt" | "option" => modifiers |= 1,
+                "ctrl" | "control" => modifiers |= 2,
+                "meta" | "cmd" | "command" | "win" | "super" => modifiers |= 4,
+                "shift" => modifiers |= 8,
+                _ => main_key = part,
+            }
+        }
+        let (key, code, vk) = key_info(main_key);
+        for kind in ["keyDown", "keyUp"] {
+            self.conn_call(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": kind,
+                    "key": key,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "nativeVirtualKeyCode": vk,
+                    "modifiers": modifiers
+                }),
+            )
+            .await?;
+        }
+        self.settle().await;
+        Ok(format!("Pressed shortcut {combo}."))
+    }
+
+    pub async fn drag(
+        &mut self,
+        from_index: Option<i64>,
+        from_x: Option<f64>,
+        from_y: Option<f64>,
+        to_index: Option<i64>,
+        to_x: Option<f64>,
+        to_y: Option<f64>,
+    ) -> Result<String, String> {
+        self.with_connection().await?;
+        let _ = self.eval(HIDE_OVERLAY_JS).await;
+        let (sx, sy) = self.point(from_index, from_x, from_y).await?;
+        let (ex, ey) = self.point(to_index, to_x, to_y).await?;
+        let _ = self.conn_call("Page.bringToFront", json!({})).await;
+        self.conn_call(
+            "Input.dispatchMouseEvent",
+            json!({ "type": "mouseMoved", "x": sx, "y": sy }),
+        )
+        .await?;
+        self.conn_call(
+            "Input.dispatchMouseEvent",
+            json!({ "type": "mousePressed", "x": sx, "y": sy, "button": "left", "clickCount": 1 }),
+        )
+        .await?;
+        let steps = 8;
+        for step in 1..=steps {
+            let t = step as f64 / steps as f64;
+            let mx = sx + (ex - sx) * t;
+            let my = sy + (ey - sy) * t;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            self.conn_call(
+                "Input.dispatchMouseEvent",
+                json!({ "type": "mouseMoved", "x": mx, "y": my, "button": "left" }),
+            )
+            .await?;
+        }
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        self.conn_call(
+            "Input.dispatchMouseEvent",
+            json!({ "type": "mouseReleased", "x": ex, "y": ey, "button": "left", "clickCount": 1 }),
+        )
+        .await?;
+        self.settle().await;
+        Ok(format!(
+            "Dragged from ({sx:.0},{sy:.0}) to ({ex:.0},{ey:.0})."
+        ))
+    }
+
+    pub async fn extract_structured(
+        &mut self,
+        kind: &str,
+        selector: Option<&str>,
+    ) -> Result<String, String> {
+        self.with_connection().await?;
+        let kind_json = serde_json::to_string(kind.trim()).map_err(|e| e.to_string())?;
+        let sel_json = serde_json::to_string(selector.unwrap_or("").trim()).map_err(|e| e.to_string())?;
+        let extracted = self
+            .eval(&format!(
+                r#"(function(){{
+  const kind = {kind_json}.toLowerCase() || 'all';
+  const sel = {sel_json};
+  const root = (sel ? document.querySelector(sel) : document) || document;
+  const clean = s => String(s || '').replace(/\s+/g, ' ').trim();
+  const out = {{ title: document.title, url: location.href }};
+  if (kind === 'all' || kind === 'headings') {{
+    out.headings = [...root.querySelectorAll('h1,h2,h3,h4')].slice(0, 40).map(h => ({{
+      level: h.tagName.toLowerCase(),
+      text: clean(h.innerText).slice(0, 160)
+    }})).filter(h => h.text);
+  }}
+  if (kind === 'all' || kind === 'tables') {{
+    out.tables = [...root.querySelectorAll('table')].slice(0, 10).map((t, idx) => {{
+      const rows = [...t.querySelectorAll('tr')].slice(0, 40).map(tr =>
+        [...tr.querySelectorAll('th,td')].slice(0, 16).map(cell => clean(cell.innerText).slice(0, 140))
+      ).filter(r => r.some(Boolean));
+      return {{ tableIndex: idx, rows }};
+    }}).filter(t => t.rows.length > 0);
+  }}
+  if (kind === 'all' || kind === 'links') {{
+    out.links = [...root.querySelectorAll('a[href]')].slice(0, 50).map(a => ({{
+      text: clean(a.innerText || a.getAttribute('aria-label')).slice(0, 100),
+      href: a.href
+    }})).filter(l => l.text && !l.href.startsWith('javascript:'));
+  }}
+  if (kind === 'all' || kind === 'lists') {{
+    out.lists = [...root.querySelectorAll('ul,ol')].slice(0, 15).map(list =>
+      [...list.querySelectorAll(':scope > li')].slice(0, 20).map(li => clean(li.innerText).slice(0, 160)).filter(Boolean)
+    ).filter(items => items.length > 0);
+  }}
+  if (kind === 'selector' && sel) {{
+    out.matches = [...document.querySelectorAll(sel)].slice(0, 40).map((el, i) => ({{
+      index: i,
+      tag: el.tagName.toLowerCase(),
+      text: clean(el.innerText || el.value || el.getAttribute('aria-label')).slice(0, 240),
+      href: el.href || undefined
+    }}));
+  }}
+  return out;
+}})()"#
+            ))
+            .await?;
+        serde_json::to_string_pretty(&extracted).map_err(|e| e.to_string())
+    }
+
+    pub async fn close_tab(&mut self, index: Option<usize>) -> Result<String, String> {
+        let pages = self.list_pages().await?;
+        if pages.is_empty() {
+            return Err("No Chrome tabs are open.".into());
+        }
+        let target = if let Some(idx) = index {
+            pages
+                .get(idx)
+                .ok_or_else(|| format!("There is no tab [{idx}]."))?
+        } else {
+            let current_url = self.active_url.as_deref().unwrap_or("");
+            pages
+                .iter()
+                .find(|p| p.url == current_url)
+                .unwrap_or(&pages[0])
+        };
+        let endpoint = format!("http://127.0.0.1:{}/json/close/{}", self.port, target.id);
+        let _ = self.http.get(endpoint).send().await;
+        self.conn = None;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = self.attach_default().await;
+        Ok(format!("Closed tab \"{}\".", target.title))
+    }
+
     pub async fn select_option(&mut self, index: i64, label: &str) -> Result<String, String> {
         self.with_connection().await?;
         let quoted = serde_json::to_string(label).map_err(|e| e.to_string())?;
         let result = self
             .eval(&format!(
-                "(function(){{const el=document.querySelector('[data-wb=\"{index}\"]');if(!el||el.tagName!=='SELECT')return {{ok:false}};const want={quoted}.toLowerCase();const opt=[...el.options].find(o=>o.value.toLowerCase()===want||o.label.toLowerCase()===want||o.text.toLowerCase()===want);if(!opt)return {{ok:false,reason:'option'}};el.value=opt.value;el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return {{ok:true,value:opt.value,label:opt.label||opt.text}};}})()"
+                "(function(){{const el=(window.__wb_get?window.__wb_get({index}):null)||document.querySelector('[data-wb=\"{index}\"]');if(!el||el.tagName!=='SELECT')return {{ok:false}};const want={quoted}.toLowerCase();const opt=[...el.options].find(o=>o.value.toLowerCase()===want||o.label.toLowerCase()===want||o.text.toLowerCase()===want||o.text.toLowerCase().includes(want));if(!opt)return {{ok:false,reason:'option'}};el.value=opt.value;el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return {{ok:true,value:opt.value,label:opt.label||opt.text}};}})()"
             ))
             .await?;
         if result["ok"].as_bool() != Some(true) {
@@ -781,7 +967,7 @@ impl Browser {
         if let Some(index) = index {
             let point = self
                 .eval(&format!(
-                    "(function(){{const el=document.querySelector('[data-wb=\"{index}\"]');if(!el)return null;const r=el.getBoundingClientRect();return {{x:r.left+r.width/2,y:r.top+r.height/2}};}})()"
+                    "(function(){{const el=(window.__wb_get?window.__wb_get({index}):null)||document.querySelector('[data-wb=\"{index}\"]');if(!el)return null;const r=el.getBoundingClientRect();return {{x:r.left+r.width/2,y:r.top+r.height/2}};}})()"
                 ))
                 .await?;
             if point.is_null() {
@@ -1228,10 +1414,24 @@ pub fn jpeg_size(data: &[u8]) -> Option<(u32, u32)> {
 
 const SNAPSHOT_JS: &str = r#"(function(){
   document.querySelectorAll('[data-wb]').forEach(function(el){ el.removeAttribute('data-wb'); });
+  window.__wb_els = {};
+  window.__wb_get = function(i){ return (window.__wb_els && window.__wb_els[i]) || document.querySelector('[data-wb="' + i + '"]'); };
   var old = document.getElementById('wb-overlay');
   if (old) old.remove();
   var selectors = 'a[href],button,input,textarea,select,summary,[role="button"],[role="link"],[role="textbox"],[role="checkbox"],[role="radio"],[role="combobox"],[role="menuitem"],[role="tab"],[role="switch"],[contenteditable="true"]';
-  var nodes = Array.from(document.querySelectorAll(selectors));
+  function collectAll(root, out) {
+    if (!root || out.length >= 220) return;
+    var found = root.querySelectorAll ? Array.from(root.querySelectorAll(selectors)) : [];
+    for (var k = 0; k < found.length; k++) {
+      out.push(found[k]);
+    }
+    var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (var m = 0; m < all.length; m++) {
+      if (all[m].shadowRoot) collectAll(all[m].shadowRoot, out);
+    }
+  }
+  var nodes = [];
+  collectAll(document, nodes);
   var vw = window.innerWidth;
   var vh = window.innerHeight;
   var items = [];
@@ -1244,9 +1444,13 @@ const SNAPSHOT_JS: &str = r#"(function(){
     if (s.visibility === 'hidden' || s.display === 'none' || Number(s.opacity) === 0) continue;
     var id = items.length;
     el.setAttribute('data-wb', String(id));
+    window.__wb_els[id] = el;
     var typ = el.getAttribute('type') || '';
     var raw = ('value' in el) ? String(el.value || '') : '';
     if (typ === 'password' && raw) raw = '••••';
+    if ((typ === 'checkbox' || typ === 'radio') && 'checked' in el) {
+      raw = el.checked ? 'checked' : 'unchecked';
+    }
     var text = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || el.innerText || el.getAttribute('name') || el.getAttribute('alt') || '').replace(/\s+/g, ' ').trim().slice(0, 90);
     items.push({
       i: id,
@@ -1261,7 +1465,7 @@ const SNAPSHOT_JS: &str = r#"(function(){
       left: Math.round(r.left),
       top: Math.round(r.top)
     });
-    if (items.length >= 70) break;
+    if (items.length >= 85) break;
   }
   var overlay = document.createElement('div');
   overlay.id = 'wb-overlay';
@@ -1274,16 +1478,30 @@ const SNAPSHOT_JS: &str = r#"(function(){
     overlay.appendChild(badge);
   }
   document.documentElement.appendChild(overlay);
-  var pageText = (document.body ? document.body.innerText : '').replace(/\n{3,}/g, '\n\n').slice(0, 1500);
+  var pageText = (document.body ? document.body.innerText : '').replace(/\n{3,}/g, '\n\n').slice(0, 1800);
   return { url: location.href, title: document.title, vw: vw, vh: vh, items: items, pageText: pageText };
 })()"#;
 
 const FULL_SCAN_JS: &str = r#"(function(){
   document.querySelectorAll('[data-wb]').forEach(function(el){ el.removeAttribute('data-wb'); });
+  window.__wb_els = {};
+  window.__wb_get = function(i){ return (window.__wb_els && window.__wb_els[i]) || document.querySelector('[data-wb="' + i + '"]'); };
   var old = document.getElementById('wb-overlay');
   if (old) old.remove();
   var selectors = 'a[href],button,input,textarea,select,summary,[role="button"],[role="link"],[role="textbox"],[role="checkbox"],[role="radio"],[role="combobox"],[role="menuitem"],[role="tab"],[role="switch"],[contenteditable="true"]';
-  var nodes = Array.from(document.querySelectorAll(selectors));
+  function collectAll(root, out) {
+    if (!root || out.length >= 300) return;
+    var found = root.querySelectorAll ? Array.from(root.querySelectorAll(selectors)) : [];
+    for (var k = 0; k < found.length; k++) {
+      out.push(found[k]);
+    }
+    var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (var m = 0; m < all.length; m++) {
+      if (all[m].shadowRoot) collectAll(all[m].shadowRoot, out);
+    }
+  }
+  var nodes = [];
+  collectAll(document, nodes);
   var items = [];
   var overlay = document.createElement('div');
   overlay.id = 'wb-overlay';
@@ -1296,9 +1514,13 @@ const FULL_SCAN_JS: &str = r#"(function(){
     if (s.visibility === 'hidden' || s.display === 'none' || Number(s.opacity) === 0) continue;
     var id = items.length;
     el.setAttribute('data-wb', String(id));
+    window.__wb_els[id] = el;
     var typ = el.getAttribute('type') || '';
     var raw = ('value' in el) ? String(el.value || '') : '';
     if (typ === 'password' && raw) raw = '••••';
+    if ((typ === 'checkbox' || typ === 'radio') && 'checked' in el) {
+      raw = el.checked ? 'checked' : 'unchecked';
+    }
     var text = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || el.innerText || el.getAttribute('name') || el.getAttribute('alt') || '').replace(/\s+/g, ' ').trim().slice(0, 100);
     var x = Math.round(r.left + scrollX + r.width / 2);
     var y = Math.round(r.top + scrollY + r.height / 2);
@@ -1307,12 +1529,12 @@ const FULL_SCAN_JS: &str = r#"(function(){
     badge.textContent = String(id);
     badge.style.cssText = 'position:absolute;left:' + Math.max(0, Math.round(r.left + scrollX)) + 'px;top:' + Math.max(0, Math.round(r.top + scrollY)) + 'px;z-index:2147483647;background:#1a1206;color:#ffd36a;font:700 11px/1.2 Segoe UI,sans-serif;padding:1px 4px;border-radius:4px;border:1px solid #ffd36a;pointer-events:none;';
     overlay.appendChild(badge);
-    if (items.length >= 180) break;
+    if (items.length >= 200) break;
   }
   document.documentElement.appendChild(overlay);
   var width = Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0, innerWidth);
   var height = Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0, innerHeight);
-  var pageText = (document.body ? document.body.innerText : '').replace(/\n{3,}/g, '\n\n').slice(0, 12000);
+  var pageText = (document.body ? document.body.innerText : '').replace(/\n{3,}/g, '\n\n').slice(0, 14000);
   return { url:location.href, title:document.title, width:width, height:height, items:items, pageText:pageText };
 })()"#;
 
