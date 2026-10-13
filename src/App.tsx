@@ -82,25 +82,26 @@ function inTauri() {
 }
 
 function applyEvent(message: ChatMessage, event: AgentEvent): ChatMessage {
+  const currentTools = Array.isArray(message.tools) ? message.tools : [];
   switch (event.type) {
     case "status":
-      return { ...message, status: event.text };
+      return { ...message, status: event.text ?? "" };
     case "thinking":
       return {
         ...message,
-        thinking: ((message.thinking || "") + event.text).slice(-12_000),
+        thinking: ((message.thinking || "") + (event.text || "")).slice(-12_000),
       };
     case "content":
-      return { ...message, content: (message.content + event.text).slice(-40_000) };
+      return { ...message, content: ((message.content || "") + (event.text || "")).slice(-40_000) };
     case "toolStart":
       return {
         ...message,
-        tools: [...message.tools, { name: event.name, args: event.args }],
+        tools: [...currentTools, { name: event.name || "tool", args: event.args || "" }],
       };
     case "toolEnd": {
       // Keeping every full screenshot made long runs consume a large amount of
       // memory and caused the composer to lag. Retain only the newest screenshot.
-      const tools: ToolTrace[] = message.tools.map((tool) => ({
+      const tools: ToolTrace[] = currentTools.map((tool) => ({
         ...tool,
         image: undefined,
       }));
@@ -113,16 +114,17 @@ function applyEvent(message: ChatMessage, event: AgentEvent): ChatMessage {
       }
       const image = event.image || undefined;
       if (index === -1) {
-        tools.push({ name: event.name, args: "", result: event.result, image });
+        tools.push({ name: event.name || "tool", args: "", result: event.result ?? "", image });
       } else {
-        tools[index] = { ...tools[index], result: event.result, image };
+        tools[index] = { ...tools[index], result: event.result ?? "", image };
       }
       return { ...message, tools };
     }
     case "plan":
-      return { ...message, plan: event.steps };
+      return { ...message, plan: Array.isArray(event.steps) ? event.steps : [] };
     case "learned": {
-      const existing = message.learned || [];
+      if (!event.item || !event.item.id) return message;
+      const existing = Array.isArray(message.learned) ? message.learned : [];
       const filtered = existing.filter((item) => item.id !== event.item.id);
       return { ...message, learned: [...filtered, event.item] };
     }
@@ -131,13 +133,15 @@ function applyEvent(message: ChatMessage, event: AgentEvent): ChatMessage {
     case "done":
       return { ...message, pending: false, status: undefined };
     case "error":
-      return { ...message, pending: false, status: undefined, error: event.text };
+      return { ...message, pending: false, status: undefined, error: event.text || "An error occurred." };
+    default:
+      return message;
   }
 }
 
 function historyPayload(messages: ChatMessage[]) {
   return messages
-    .filter((message) => message.role === "user" || (message.role === "assistant" && !message.pending))
+    .filter((message) => message && (message.role === "user" || (message.role === "assistant" && !message.pending)))
     .map((message) => ({
       role: message.role,
       content: storedContent(message),
@@ -146,11 +150,11 @@ function historyPayload(messages: ChatMessage[]) {
 }
 
 function storedContent(message: ChatMessage) {
-  const actions = message.tools
-    .filter((tool) => tool.result)
+  const actions = (Array.isArray(message.tools) ? message.tools : [])
+    .filter((tool) => tool && tool.result)
     .map((tool) => `${toolLabel(tool.name)}: ${tool.result}`)
     .join("\n");
-  return [message.content.trim(), actions ? `Actions:\n${actions}` : ""]
+  return [(message.content || "").trim(), actions ? `Actions:\n${actions}` : ""]
     .filter(Boolean)
     .join("\n\n");
 }
@@ -295,7 +299,23 @@ export default function App() {
     if (saved) {
       try {
         const parsed = JSON.parse(saved) as ChatMessage[];
-        setMessages(parsed.map((message) => ({ ...message, pending: false, images: undefined })));
+        if (Array.isArray(parsed)) {
+          setMessages(
+            parsed
+              .filter((m): m is ChatMessage => Boolean(m && typeof m === "object" && m.id && m.role))
+              .map((message) => ({
+                ...message,
+                content: String(message.content ?? ""),
+                tools: Array.isArray(message.tools)
+                  ? message.tools.map((tool) => ({ ...tool, image: undefined }))
+                  : [],
+                pending: false,
+                images: undefined,
+              })),
+          );
+        } else {
+          localStorage.removeItem(STORAGE_KEY);
+        }
       } catch {
         localStorage.removeItem(STORAGE_KEY);
       }
@@ -308,14 +328,22 @@ export default function App() {
       skipSave.current = false;
       return;
     }
-    const slim = messages
-      .filter((message) => !message.pending)
-      .map((message) => ({
-        ...message,
-        images: undefined,
-        tools: message.tools.map((tool) => ({ ...tool, image: undefined })),
-      }));
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
+    try {
+      const slim = messages
+        .filter((message) => message && !message.pending)
+        .slice(-40)
+        .map((message) => ({
+          ...message,
+          images: undefined,
+          tools: (Array.isArray(message.tools) ? message.tools : []).map((tool) => ({
+            ...tool,
+            image: undefined,
+          })),
+        }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
+    } catch {
+      // Ignore quota errors so long transcripts never unmount the UI
+    }
   }, [messages]);
 
   useEffect(() => {
@@ -326,7 +354,9 @@ export default function App() {
     if (!inTauri()) return;
     try {
       const snap = await invoke<MemorySnapshot>("get_memories");
-      setMemories(snap);
+      if (snap && Array.isArray(snap.items)) {
+        setMemories(snap);
+      }
     } catch {
       // ignore
     }
@@ -361,7 +391,9 @@ export default function App() {
         ]);
         if (!alive) return;
         setSettings(loaded);
-        setMemories(memSnap);
+        if (memSnap && Array.isArray(memSnap.items)) {
+          setMemories(memSnap);
+        }
         await refresh();
       } catch (error) {
         if (alive) setBanner(String(error));
@@ -369,13 +401,23 @@ export default function App() {
         if (alive) setBooting(false);
       }
       const stop = await listen<AgentEvent>("agent-event", (event) => {
+        if (!event?.payload) return;
         if (event.payload.type === "telemetry") {
+          const raw = event.payload as Extract<AgentEvent, { type: "telemetry" }> & {
+            max_steps?: number;
+            active_model?: string;
+            memories_applied?: string[];
+          };
           setTelemetry({
-            step: event.payload.step,
-            maxSteps: event.payload.maxSteps,
-            activeModel: event.payload.activeModel,
-            domain: event.payload.domain,
-            memoriesApplied: event.payload.memoriesApplied,
+            step: Number(raw.step) || 1,
+            maxSteps: Number(raw.maxSteps ?? raw.max_steps) || 777,
+            activeModel: String(raw.activeModel ?? raw.active_model ?? ""),
+            domain: String(raw.domain ?? "*"),
+            memoriesApplied: Array.isArray(raw.memoriesApplied)
+              ? raw.memoriesApplied
+              : Array.isArray(raw.memories_applied)
+                ? raw.memories_applied
+                : [],
           });
           return;
         }
@@ -633,10 +675,13 @@ export default function App() {
 
   const connected = status?.connected ?? false;
   const isDark = settings.theme === "dark";
-  const skills = memories.items.filter((item) => item.kind === "skill");
-  const filteredMemories = memories.items.filter(
-    (item) => vaultFilter === "all" || item.kind === vaultFilter,
+  const memoryItems = Array.isArray(memories?.items) ? memories.items : [];
+  const memoryStats = memories?.stats ?? DEFAULT_MEMORY_SNAPSHOT.stats;
+  const skills = memoryItems.filter((item) => item && item.kind === "skill");
+  const filteredMemories = memoryItems.filter(
+    (item) => item && (vaultFilter === "all" || item.kind === vaultFilter),
   );
+  const appliedMemories = Array.isArray(telemetry?.memoriesApplied) ? telemetry.memoriesApplied : [];
 
   return (
     <div className="app" data-theme={isDark ? "dark" : "light"}>
@@ -672,7 +717,7 @@ export default function App() {
             onClick={() => setActiveTab("vault")}
           >
             <span>◈</span> Memory Vault
-            <strong className="pill-count">{memories.stats.totalMemories}</strong>
+            <strong className="pill-count">{memoryStats.totalMemories ?? memoryItems.length}</strong>
           </button>
         </div>
 
@@ -730,7 +775,7 @@ export default function App() {
               </button>
             </form>
           )}
-          {status && status.tabs.length > 0 && (
+          {status && Array.isArray(status.tabs) && status.tabs.length > 0 && (
             <ul className="tabs">
               {status.tabs.slice(0, 5).map((tab) => (
                 <li key={tab.index}>
@@ -944,21 +989,21 @@ export default function App() {
           <div className="telemetry-bar" role="status" aria-live="polite">
             <div className="telemetry-meta">
               <span className="telemetry-badge">
-                Step {telemetry.step} / {telemetry.maxSteps}
+                Step {telemetry.step} / {telemetry.maxSteps || settings.maxSteps}
               </span>
               <span className="telemetry-model">
-                Orchestrator: <strong>{telemetry.activeModel}</strong>
+                Orchestrator: <strong>{telemetry.activeModel || settings.model}</strong>
               </span>
               {telemetry.domain && telemetry.domain !== "*" && (
                 <span className="telemetry-domain">Domain: {telemetry.domain}</span>
               )}
-              {telemetry.memoriesApplied.length > 0 && (
+              {appliedMemories.length > 0 && (
                 <span
                   className="telemetry-memory"
-                  title={telemetry.memoriesApplied.join(", ")}
+                  title={appliedMemories.join(", ")}
                 >
-                  ◈ {telemetry.memoriesApplied.length} memory playbook
-                  {telemetry.memoriesApplied.length === 1 ? "" : "s"} active
+                  ◈ {appliedMemories.length} memory playbook
+                  {appliedMemories.length === 1 ? "" : "s"} active
                 </span>
               )}
             </div>
@@ -966,7 +1011,7 @@ export default function App() {
               <div
                 className="telemetry-fill"
                 style={{
-                  width: `${Math.min(100, Math.max(2, (telemetry.step / telemetry.maxSteps) * 100))}%`,
+                  width: `${Math.min(100, Math.max(2, (telemetry.step / Math.max(1, telemetry.maxSteps || settings.maxSteps || 1)) * 100))}%`,
                 }}
               />
             </div>
@@ -978,23 +1023,23 @@ export default function App() {
             <section className="vault-stats">
               <div className="stat-card">
                 <span>Total Memories</span>
-                <strong>{memories.stats.totalMemories}</strong>
-                <small>{memories.stats.playbooksCount} site playbooks · {memories.stats.pitfallsCount} pitfalls</small>
+                <strong>{memoryStats.totalMemories ?? memoryItems.length}</strong>
+                <small>{memoryStats.playbooksCount ?? 0} site playbooks · {memoryStats.pitfallsCount ?? 0} pitfalls</small>
               </div>
               <div className="stat-card">
                 <span>Domains Learned</span>
-                <strong>{memories.stats.domainsLearned}</strong>
+                <strong>{memoryStats.domainsLearned ?? 0}</strong>
                 <small>Auto-recalled when visiting matching sites</small>
               </div>
               <div className="stat-card">
                 <span>Memory Applications</span>
-                <strong>{memories.stats.totalApplications}</strong>
+                <strong>{memoryStats.totalApplications ?? 0}</strong>
                 <small>Injected into [memory-vault] briefings</small>
               </div>
               <div className="stat-card">
                 <span>Tasks &amp; Self-Heals</span>
                 <strong>
-                  {memories.stats.tasksCompleted} / {memories.stats.selfHeals}
+                  {memoryStats.tasksCompleted ?? 0} / {memoryStats.selfHeals ?? 0}
                 </strong>
                 <small>Completed runs &amp; Argon obstacle recoveries</small>
               </div>
@@ -1106,22 +1151,22 @@ export default function App() {
                     filteredMemories.map((item) => (
                       <article key={item.id} className="memory-card">
                         <div className="memory-card-head">
-                          <span className={`kind-badge kind-${item.kind}`}>
-                            {item.kind.toUpperCase()}
+                          <span className={`kind-badge kind-${item.kind || "playbook"}`}>
+                            {(item.kind || "playbook").toUpperCase()}
                           </span>
                           <span className="domain-badge">
                             {item.domain === "*" ? "Global (*)" : item.domain}
                           </span>
                           <span className="meta-badge">
-                            {item.confidence}% conf · Used {item.uses}×
+                            {item.confidence ?? 85}% conf · Used {item.uses ?? 0}×
                           </span>
-                          <span className="source-badge">{item.source}</span>
+                          <span className="source-badge">{item.source || "agent"}</span>
                         </div>
                         <h4>{item.title}</h4>
                         <p>{item.content}</p>
                         <div className="memory-card-foot">
                           <div className="tag-list">
-                            {item.tags.map((tag) => (
+                            {(Array.isArray(item.tags) ? item.tags : []).map((tag) => (
                               <span key={tag} className="tag-chip">
                                 #{tag}
                               </span>
@@ -1224,7 +1269,7 @@ export default function App() {
                   <span className="who">
                     {message.role === "user" ? "You" : "Gemma"}
                   </span>
-                  {message.images && message.images.length > 0 && (
+                  {Array.isArray(message.images) && message.images.length > 0 && (
                     <div className="shots">
                       {message.images.map((image, index) => (
                         <button
@@ -1238,26 +1283,26 @@ export default function App() {
                       ))}
                     </div>
                   )}
-                  {message.plan && message.plan.length > 0 && (
+                  {Array.isArray(message.plan) && message.plan.length > 0 && (
                     <div className="plan-card">
                       <div className="plan-head">
                         <strong>Mission Checkpoints</strong>
                         <span>
-                          {message.plan.filter((s) => s.status === "done").length} /{" "}
+                          {message.plan.filter((s) => s && s.status === "done").length} /{" "}
                           {message.plan.length} complete
                         </span>
                       </div>
                       <ul className="plan-list">
                         {message.plan.map((step, idx) => (
-                          <li key={`${step.title}-${idx}`} className={`plan-${step.status}`}>
+                          <li key={`${step?.title || idx}-${idx}`} className={`plan-${step?.status || "pending"}`}>
                             <span className="plan-icon">
-                              {step.status === "done"
+                              {step?.status === "done"
                                 ? "✓"
-                                : step.status === "in_progress"
+                                : step?.status === "in_progress"
                                   ? "◎"
                                   : "○"}
                             </span>
-                            <span>{step.title}</span>
+                            <span>{step?.title || ""}</span>
                           </li>
                         ))}
                       </ul>
@@ -1277,7 +1322,7 @@ export default function App() {
                     </details>
                   )}
                   {message.content && <p className="body">{message.content}</p>}
-                  {message.learned && message.learned.length > 0 && (
+                  {Array.isArray(message.learned) && message.learned.length > 0 && (
                     <div className="learned-banner">
                       {message.learned.map((item) => (
                         <div key={item.id} className="learned-chip">
@@ -1287,7 +1332,7 @@ export default function App() {
                       ))}
                     </div>
                   )}
-                  {message.tools.length > 0 && (
+                  {Array.isArray(message.tools) && message.tools.length > 0 && (
                     <div className="tools">
                       {message.tools.map((tool, index) => (
                         <ToolCard
@@ -1368,7 +1413,7 @@ export default function App() {
                     className="ghost"
                     onClick={() => setActiveTab("vault")}
                   >
-                    ◈ Memory ({memories.stats.totalMemories})
+                    ◈ Memory ({memoryStats.totalMemories ?? memoryItems.length})
                   </button>
                 </div>
                 <input

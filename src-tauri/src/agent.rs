@@ -28,7 +28,7 @@ pub struct PlanStep {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum AgentEvent {
     Status {
         text: String,
@@ -54,6 +54,7 @@ pub enum AgentEvent {
     Learned {
         item: MemoryItem,
     },
+    #[serde(rename_all = "camelCase")]
     Telemetry {
         step: u32,
         max_steps: u32,
@@ -1255,5 +1256,23 @@ mod tests {
     #[test]
     fn ignores_plain_json() {
         assert!(parse_text_calls("{\"name\": \"Ada\"}").is_empty());
+    }
+
+    #[test]
+    fn serializes_telemetry_event_in_camel_case() {
+        let ev = AgentEvent::Telemetry {
+            step: 2,
+            max_steps: 777,
+            active_model: "gemini-4-argon".into(),
+            domain: "github.com".into(),
+            memories_applied: vec!["PR Playbook".into()],
+        };
+        let val = serde_json::to_value(ev).unwrap();
+        assert_eq!(val["type"], "telemetry");
+        assert_eq!(val["step"], 2);
+        assert_eq!(val["maxSteps"], 777);
+        assert_eq!(val["activeModel"], "gemini-4-argon");
+        assert_eq!(val["domain"], "github.com");
+        assert_eq!(val["memoriesApplied"][0], "PR Playbook");
     }
 }
