@@ -1,4 +1,5 @@
-use crate::browser::Browser;
+use crate::browser::{choose_file_input, Browser};
+use crate::documents::{self, DocumentVault};
 use crate::memory::{extract_domain, MemoryItem, MemoryVault};
 use crate::ollama::{self, arg_bool, arg_f64, arg_i64, arg_string, ChatMessage, ToolCall, ToolFunction};
 use crate::settings::Settings;
@@ -74,6 +75,9 @@ pub async fn run(
     browser: &Mutex<Browser>,
     memory: &Mutex<MemoryVault>,
     memory_path: &Path,
+    documents: &Mutex<DocumentVault>,
+    documents_path: &Path,
+    documents_dir: &Path,
     cancel: &AtomicBool,
     message: String,
     images: Vec<String>,
@@ -191,6 +195,10 @@ pub async fn run(
         }
         applied
     };
+    {
+        let docs = documents.lock().await;
+        user_text = format!("{user_text}\n\n{}", docs.context_block());
+    }
 
     let task_message_index = messages.len();
     let mut user = ChatMessage::text("user", user_text);
@@ -459,17 +467,43 @@ pub async fn run(
                 handle_memory_save(&app, memory, memory_path, browser, &call.function.arguments).await
             } else if name == "memory_search" {
                 handle_memory_search(memory, browser, &call.function.arguments).await
+            } else if name == "docs_list" {
+                Ok(documents.lock().await.list_text())
+            } else if name == "docs_read" {
+                let id = arg_string(&call.function.arguments, "id").ok_or("docs_read needs an id.")?;
+                documents.lock().await.read(&id)
+            } else if name == "docs_draft" {
+                handle_docs_draft(
+                    &app,
+                    &settings,
+                    browser,
+                    documents,
+                    documents_path,
+                    documents_dir,
+                    cancel,
+                    &messages,
+                    &call.function.arguments,
+                )
+                .await
+            } else if name == "docs_attach" {
+                used_browser = true;
+                handle_docs_attach(browser, documents, documents_dir, &call.function.arguments).await
             } else {
                 dispatch(browser, call).await
             };
             if let Ok(ref ok_text) = result {
-                if name.starts_with("browser_") && name != "browser_look" && name != "browser_scan" {
+                if (name.starts_with("browser_") && name != "browser_look" && name != "browser_scan")
+                    || name == "docs_attach"
+                    || name == "docs_draft"
+                {
                     action_trace.push(format!("{name} ({})", truncate(ok_text, 64)));
                 }
                 if name == "browser_review" {
                     reviewed_since_change = true;
-                } else if matches!(name.as_str(), "browser_type" | "browser_select" | "browser_drag")
-                    || (name == "browser_click" && !is_final_action)
+                } else if matches!(
+                    name.as_str(),
+                    "browser_type" | "browser_select" | "browser_drag" | "docs_attach"
+                ) || (name == "browser_click" && !is_final_action)
                 {
                     reviewed_since_change = false;
                 }
@@ -745,6 +779,143 @@ async fn handle_memory_search(
     Ok(lines.join("\n"))
 }
 
+async fn handle_docs_draft(
+    app: &AppHandle,
+    settings: &Settings,
+    browser: &Mutex<Browser>,
+    documents: &Mutex<DocumentVault>,
+    documents_path: &Path,
+    documents_dir: &Path,
+    cancel: &AtomicBool,
+    messages: &[ChatMessage],
+    args: &Value,
+) -> Result<String, String> {
+    let kind = documents::normalize_draft_kind(
+        &arg_string(args, "kind").unwrap_or_else(|| "cover_letter".into()),
+    );
+    let job_title = arg_string(args, "job_title").unwrap_or_default();
+    let company = arg_string(args, "company").unwrap_or_default();
+    let notes = arg_string(args, "notes").unwrap_or_default();
+    let source_id = arg_string(args, "source_id");
+    let (profile, source) = {
+        let docs = documents.lock().await;
+        if !docs.has_material(source_id.as_deref()) {
+            return Err(
+                "No resume or profile summary is in the holder. Ask the user to add one in the Documents tab before drafting."
+                    .into(),
+            );
+        }
+        (docs.profile().clone(), docs.source_material(source_id.as_deref()))
+    };
+    let mut job_text = arg_string(args, "job_text").unwrap_or_default();
+    if job_text.trim().is_empty() {
+        job_text = last_browser_text(messages);
+    }
+    if job_text.trim().is_empty() {
+        if let Ok(text) = browser.lock().await.read_text(8000).await {
+            job_text = text;
+        }
+    }
+    emit(
+        app,
+        AgentEvent::Status {
+            text: format!("Drafting {}…", kind.replace('_', " ")),
+        },
+    );
+    let body = documents::write_body(
+        settings,
+        &profile,
+        &source,
+        &kind,
+        &job_title,
+        &company,
+        &job_text,
+        &notes,
+        cancel,
+    )
+    .await?;
+    let mut composed = documents::compose_document(&profile, &kind, &body, &job_title, &company);
+    if let Ok(pdf) = browser.lock().await.render_html_pdf(&composed.html).await {
+        composed.pdf = pdf;
+    }
+    let stored = {
+        let mut docs = documents.lock().await;
+        let doc = docs.store_generated(documents_dir, &composed, &kind, &job_title, &company)?;
+        docs.save(documents_path)?;
+        doc
+    };
+    Ok(format!(
+        "Created \"{}\" (id={}) as PDF and DOCX.\n{}",
+         composed.title,
+        stored,
+        truncate(&composed.plain, 900)
+    ))
+}
+
+async fn handle_docs_attach(
+    browser: &Mutex<Browser>,
+    documents: &Mutex<DocumentVault>,
+    documents_dir: &Path,
+    args: &Value,
+) -> Result<String, String> {
+    let id = arg_string(args, "id").ok_or("docs_attach needs a document id.")?;
+    let method = arg_string(args, "method").unwrap_or_else(|| "auto".into());
+    let requested_format = arg_string(args, "format");
+    let file_index = arg_i64(args, "file_index");
+    let drop_index = arg_i64(args, "drop_index");
+    let click_index = arg_i64(args, "click_index");
+    let x = arg_f64(args, "x");
+    let y = arg_f64(args, "y");
+
+    let kind = documents.lock().await.kind_of(&id)?;
+    let targets = browser.lock().await.file_targets().await.unwrap_or_default();
+    let chosen_input = choose_file_input(&targets, &kind, file_index).ok().cloned();
+    let accept = chosen_input
+        .as_ref()
+        .map(|target| target.accept.as_str())
+        .unwrap_or("");
+    let path = {
+        let docs = documents.lock().await;
+        let fmt = docs.select_format(&id, requested_format.as_deref(), accept)?;
+        docs.absolute(documents_dir, &id, &fmt)?
+    };
+
+    let mut guard = browser.lock().await;
+    match method.to_lowercase().as_str() {
+        "upload" => {
+            let target = choose_file_input(&targets, &kind, file_index)?;
+            guard.upload_file(target.index, &path).await
+        }
+        "drop" => guard.drop_file(drop_index, x, y, &path).await,
+        "chooser" => guard.upload_via_chooser(click_index, x, y, &path).await,
+        _ => {
+            if let Some(index) = file_index {
+                return guard.upload_file(index, &path).await;
+            }
+            if drop_index.is_some() {
+                return guard.drop_file(drop_index, x, y, &path).await;
+            }
+            if click_index.is_some() {
+                return guard.upload_via_chooser(click_index, x, y, &path).await;
+            }
+            if let Some(target) = chosen_input {
+                if let Ok(done) = guard.upload_file(target.index, &path).await {
+                    return Ok(done);
+                }
+            }
+            if let Some(drop) = targets.iter().find(|target| target.kind == "drop") {
+                if let Ok(done) = guard.drop_file(Some(drop.index), None, None, &path).await {
+                    return Ok(done);
+                }
+            }
+            if x.is_some() && y.is_some() {
+                return guard.drop_file(None, x, y, &path).await;
+            }
+            Err("Could not find a file input or drop zone automatically. Pass file_index, drop_index, or click_index.".into())
+        }
+    }
+}
+
 async fn dispatch(browser: &Mutex<Browser>, call: &ToolCall) -> Result<String, String> {
     let args = &call.function.arguments;
     let mut guard = browser.lock().await;
@@ -862,10 +1033,11 @@ fn changes_page(name: &str) -> bool {
             | "browser_forward"
             | "browser_reload"
             | "browser_select"
-            | "browser_review"
+            |         "browser_review"
             | "browser_switch_tab"
             | "browser_new_tab"
             | "browser_close_tab"
+            | "docs_attach"
     )
 }
 
@@ -891,6 +1063,10 @@ const KNOWN_TOOLS: &[&str] = &[
     "browser_switch_tab",
     "browser_new_tab",
     "browser_close_tab",
+    "docs_list",
+    "docs_read",
+    "docs_draft",
+    "docs_attach",
     "plan_update",
     "memory_save",
     "memory_search",
@@ -1168,6 +1344,37 @@ fn tool_schema() -> Value {
                 "domain":{"type":"string"}
             }
         })),
+        tool("docs_list", "List the applicant profile and every stored or generated document in the holder.", json!({"type":"object","properties":{}})),
+        tool("docs_read", "Read the full extracted text of a document in the holder before answering application questions or writing a cover letter.", json!({
+            "type":"object",
+            "required":["id"],
+            "properties":{"id":{"type":"string","description":"Document id from [documents] or docs_list"}}
+        })),
+        tool("docs_draft", "Create a realistic application document (cover_letter, thank_you, resume, or other) from the applicant's stored resume/profile and the current job posting, render it as PDF and DOCX, and save it in the holder. Never invent employers, titles, schools, or dates.", json!({
+            "type":"object",
+            "properties":{
+                "kind":{"type":"string","enum":["cover_letter","thank_you","resume","other"]},
+                "job_title":{"type":"string"},
+                "company":{"type":"string"},
+                "job_text":{"type":"string","description":"Optional job description; defaults to the current page"},
+                "source_id":{"type":"string","description":"Optional resume id to ground the draft"},
+                "notes":{"type":"string","description":"Optional angle or requirement from the application"}
+            }
+        })),
+        tool("docs_attach", "Provide a stored or newly drafted document to the job site via file input upload, drag-and-drop onto a drop zone, or an Upload button's file chooser. Use file_index, drop_index, or click_index from the observation.", json!({
+            "type":"object",
+            "required":["id"],
+            "properties":{
+                "id":{"type":"string","description":"Document id from [documents], docs_list, or docs_draft"},
+                "method":{"type":"string","enum":["auto","upload","drop","chooser"]},
+                "format":{"type":"string","enum":["pdf","docx","original"]},
+                "file_index":{"type":"integer","description":"Index from [file N] in file targets"},
+                "drop_index":{"type":"integer","description":"Index from [drop N] in file targets"},
+                "click_index":{"type":"integer","description":"Clickable element index that opens a file chooser"},
+                "x":{"type":"number"},
+                "y":{"type":"number"}
+            }
+        })),
         tool("wait", "Wait for a page to finish loading or an animation to end, then look again.", json!({
             "type":"object",
             "properties":{"seconds":{"type":"number"}}
@@ -1203,6 +1410,7 @@ How to work:
 - For multi-step tasks, call plan_update early to outline 2-6 clear checkpoints and update them as you progress.
 - Before the first action on any new page, study the entire FULL PAGE SCAN from top to bottom. Understand the page's purpose, sections, forms, off-screen controls, and final actions before clicking anything. Navigation automatically produces a new full-page scan; call browser_scan again whenever the layout or task state is unclear.
 - Apply any [memory-vault] playbooks, pitfalls, and preferences for the current domain. When you discover a non-obvious site workflow, overcome a tricky UI obstacle, or learn a user preference, call memory_save (or pass a `lesson` in task_done) so you permanently improve on future runs.
+- Use [documents], docs_read, docs_draft, and docs_attach for job applications. Attach the stored resume with docs_attach. When a cover letter or application note is needed, read the job and resume, call docs_draft to generate a tailored PDF/DOCX grounded strictly in the applicant's real resume/profile, then call docs_attach (via file_index upload, drop_index drag-and-drop, or click_index chooser). Never fabricate employers, dates, schools, or achievements.
 - Do not click merely because an element looks plausible. First connect the action to the user's original goal and explain it in your private reasoning.
 - Read the user's entire original prompt before planning. Inspect attached/reference images carefully: compare text, layout, colors, counts, selections, and other visible details instead of making a quick guess.
 - Think about what is on screen, compare it to the original prompt and reference images, then act with a tool. Every reply should include a tool call until the task is finished.

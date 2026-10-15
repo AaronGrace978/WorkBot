@@ -41,6 +41,15 @@ pub struct Observation {
     pub jpeg_b64: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct FileTarget {
+    pub index: i64,
+    pub kind: String,
+    pub label: String,
+    pub accept: String,
+    pub hidden: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct TargetInfo {
     #[serde(default)]
@@ -67,6 +76,7 @@ struct Cdp {
     pending: PendingCalls,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
+    chooser: Arc<Mutex<Option<Value>>>,
     reader: tokio::task::JoinHandle<()>,
 }
 
@@ -86,9 +96,11 @@ impl Cdp {
         let writer = Arc::new(Mutex::new(sink));
         let pending: PendingCalls = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
+        let chooser = Arc::new(Mutex::new(None));
         let writer_task = writer.clone();
         let pending_task = pending.clone();
         let alive_task = alive.clone();
+        let chooser_task = chooser.clone();
         let reader = tokio::spawn(async move {
             let mut dialog_id: u64 = 1 << 40;
             while let Some(msg) = incoming.next().await {
@@ -98,7 +110,11 @@ impl Cdp {
                             continue;
                         };
                         let Some(id) = value.get("id").and_then(|v| v.as_u64()) else {
-                            if value["method"].as_str() == Some("Page.javascriptDialogOpening") {
+                            if value["method"].as_str() == Some("Page.fileChooserOpened") {
+                            *chooser_task.lock().await = Some(value.get("params").cloned().unwrap_or(Value::Null));
+                            continue;
+                        }
+                        if value["method"].as_str() == Some("Page.javascriptDialogOpening") {
                                 let reply = json!({
                                     "id": dialog_id,
                                     "method": "Page.handleJavaScriptDialog",
@@ -141,6 +157,7 @@ impl Cdp {
             pending,
             next_id: AtomicU64::new(1),
             alive,
+            chooser,
             reader,
         };
         cdp.call("Page.enable", json!({})).await?;
@@ -157,6 +174,10 @@ impl Cdp {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.call_for(method, params, Duration::from_secs(8)).await
+    }
+
+    async fn call_for(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
         if !self.alive.load(Ordering::SeqCst) {
             return Err("Chrome connection closed".into());
         }
@@ -175,7 +196,7 @@ impl Cdp {
             self.alive.store(false, Ordering::SeqCst);
             return Err(format!("Chrome connection failed: {err}"));
         }
-        match tokio::time::timeout(Duration::from_secs(8), rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("Chrome connection closed".into()),
             Err(_) => {
@@ -367,6 +388,9 @@ impl Browser {
                 lines.push(desc);
             }
         }
+        if let Ok(targets) = self.file_targets().await {
+            lines.push(describe_file_targets(&targets));
+        }
         if let Some(text) = scan["pageText"].as_str().filter(|text| !text.trim().is_empty()) {
             lines.push(format!("whole-page text:\n{text}"));
         }
@@ -542,6 +566,9 @@ impl Browser {
                 desc.push_str(&format!(" at ({:.0},{:.0})", x, y));
                 lines.push(desc);
             }
+        }
+        if let Ok(targets) = self.file_targets().await {
+            lines.push(describe_file_targets(&targets));
         }
         if let Some(text) = snap["pageText"].as_str() {
             let text = text.trim();
@@ -963,6 +990,209 @@ impl Browser {
         Ok(format!("Opened a new tab at {url}."))
     }
 
+    pub async fn file_targets(&mut self) -> Result<Vec<FileTarget>, String> {
+        self.with_connection().await?;
+        let value = self.eval(FILE_CENSUS_JS).await?;
+        let mut targets = Vec::new();
+        if let Some(files) = value["files"].as_array() {
+            for item in files {
+                targets.push(FileTarget {
+                    index: item["i"].as_i64().unwrap_or(0),
+                    kind: "file".into(),
+                    label: item["label"].as_str().unwrap_or("").to_string(),
+                    accept: item["accept"].as_str().unwrap_or("").to_string(),
+                    hidden: item["hidden"].as_bool().unwrap_or(false),
+                });
+            }
+        }
+        if let Some(drops) = value["drops"].as_array() {
+            for item in drops {
+                targets.push(FileTarget {
+                    index: item["i"].as_i64().unwrap_or(0),
+                    kind: "drop".into(),
+                    label: item["text"].as_str().unwrap_or("").to_string(),
+                    accept: String::new(),
+                    hidden: false,
+                });
+            }
+        }
+        Ok(targets)
+    }
+
+    pub async fn upload_file(&mut self, file_index: i64, path: &Path) -> Result<String, String> {
+        self.with_connection().await?;
+        let _ = self.file_targets().await?;
+        let object_id = self
+            .object_id(&format!(
+                "(function(){{const el=window.__wb_files&&window.__wb_files[{file_index}];return el||null;}})()"
+            ))
+            .await?;
+        let _ = self.conn_call("DOM.enable", json!({})).await;
+        let node = self
+            .conn_call("DOM.requestNode", json!({ "objectId": object_id }))
+            .await?;
+        let _ = self
+            .conn_call("Runtime.releaseObject", json!({ "objectId": object_id }))
+            .await;
+        let node_id = node["nodeId"].as_u64().ok_or("Chrome did not return that file input.")?;
+        let file = chrome_file_arg(path)?;
+        self.conn_call(
+            "DOM.setFileInputFiles",
+            json!({ "nodeId": node_id, "files": [file] }),
+        )
+        .await?;
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        Ok(format!("Uploaded {name} into file input [{file_index}]."))
+    }
+
+    pub async fn drop_file(
+        &mut self,
+        drop_index: Option<i64>,
+        x: Option<f64>,
+        y: Option<f64>,
+        path: &Path,
+    ) -> Result<String, String> {
+        self.with_connection().await?;
+        let _ = self.eval(HIDE_OVERLAY_JS).await;
+        let (cx, cy) = if let Some(index) = drop_index {
+            let point = self
+                .eval(&format!(
+                    "(function(){{const el=window.__wb_drops&&window.__wb_drops[{index}];if(!el)return null;el.scrollIntoView({{block:'center',inline:'nearest'}});const r=el.getBoundingClientRect();return {{x:r.left+r.width/2,y:r.top+r.height/2}};}})()"
+                ))
+                .await?;
+            if point.is_null() {
+                return Err(format!("Drop zone [{index}] is not on the page. Look again."));
+            }
+            (point["x"].as_f64().unwrap_or(0.0), point["y"].as_f64().unwrap_or(0.0))
+        } else {
+            self.point(None, x, y).await?
+        };
+        let file = chrome_file_arg(path)?;
+        let data = json!({
+            "items": [],
+            "files": [file],
+            "dragOperationsMask": 1
+        });
+        for kind in ["dragEnter", "dragOver", "drop"] {
+            self.conn_call(
+                "Input.dispatchDragEvent",
+                json!({ "type": kind, "x": cx, "y": cy, "data": data }),
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        Ok(format!("Dropped {name} at ({cx:.0},{cy:.0})."))
+    }
+
+    pub async fn upload_via_chooser(
+        &mut self,
+        click_index: Option<i64>,
+        x: Option<f64>,
+        y: Option<f64>,
+        path: &Path,
+    ) -> Result<String, String> {
+        self.with_connection().await?;
+        if let Some(conn) = self.conn.as_ref() {
+            *conn.chooser.lock().await = None;
+        }
+        self.conn_call("Page.setInterceptFileChooserDialog", json!({ "enabled": true }))
+            .await?;
+        let clicked = self.click(click_index, x, y, "left", 1).await;
+        if let Err(err) = clicked {
+            let _ = self
+                .conn_call("Page.setInterceptFileChooserDialog", json!({ "enabled": false }))
+                .await;
+            return Err(err);
+        }
+        let mut opened = false;
+        for _ in 0..30 {
+            let ready = self
+                .conn
+                .as_ref()
+                .is_some_and(|conn| conn.chooser.try_lock().is_ok_and(|slot| slot.is_some()));
+            if ready {
+                opened = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let file = chrome_file_arg(path)?;
+        let accepted = if opened {
+            self.conn_call(
+                "Page.handleFileChooser",
+                json!({ "action": "accept", "files": [file] }),
+            )
+            .await
+        } else {
+            Err("The page did not open a file chooser. Use file_index for a file input or drop_index for a drop zone.".into())
+        };
+        let _ = self
+            .conn_call("Page.setInterceptFileChooserDialog", json!({ "enabled": false }))
+            .await;
+        accepted?;
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        Ok(format!("Sent {name} through the file chooser."))
+    }
+
+    pub async fn render_html_pdf(&mut self, html: &str) -> Result<Vec<u8>, String> {
+        self.with_connection().await?;
+        let created = match self
+            .conn_call(
+                "Target.createTarget",
+                json!({ "url": "about:blank", "background": true }),
+            )
+            .await
+        {
+            Ok(value) if value["targetId"].as_str().is_some() => value,
+            _ => {
+                self.conn_call("Target.createTarget", json!({ "url": "about:blank" }))
+                    .await?
+            }
+        };
+        let target_id = created["targetId"]
+            .as_str()
+            .ok_or("Chrome did not open a page for the PDF.")?
+            .to_string();
+        let mut socket = None;
+        for _ in 0..20 {
+            if let Ok(pages) = self.list_pages().await {
+                if let Some(page) = pages.into_iter().find(|page| page.id == target_id) {
+                    socket = page.ws;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let result = if let Some(socket) = socket {
+            print_html_pdf(&socket, html).await
+        } else {
+            Err("The PDF page did not start.".into())
+        };
+        let _ = self
+            .http
+            .get(format!("http://127.0.0.1:{}/json/close/{target_id}", self.port))
+            .send()
+            .await;
+        result
+    }
+
+    async fn object_id(&mut self, expression: &str) -> Result<String, String> {
+        let result = self
+            .conn_call(
+                "Runtime.evaluate",
+                json!({ "expression": expression, "returnByValue": false }),
+            )
+            .await?;
+        if result.get("exceptionDetails").is_some() {
+            return Err("Could not reach that file input.".into());
+        }
+        result["result"]["objectId"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "That file input is not on the page. Look again.".into())
+    }
+
     async fn point(&mut self, index: Option<i64>, x: Option<f64>, y: Option<f64>) -> Result<(f64, f64), String> {
         if let Some(index) = index {
             let point = self
@@ -1240,6 +1470,113 @@ impl Browser {
     }
 }
 
+async fn print_html_pdf(ws: &str, html: &str) -> Result<Vec<u8>, String> {
+    let cdp = Cdp::connect(ws).await?;
+    let tree = cdp.call("Page.getFrameTree", json!({})).await?;
+    let frame_id = tree["frameTree"]["frame"]["id"]
+        .as_str()
+        .ok_or("Chrome did not return a document frame.")?
+        .to_string();
+    cdp.call(
+        "Page.setDocumentContent",
+        json!({ "frameId": frame_id, "html": html }),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let pdf = cdp
+        .call_for(
+            "Page.printToPDF",
+            json!({
+                "printBackground": true,
+                "paperWidth": 8.5,
+                "paperHeight": 11,
+                "marginTop": 0.55,
+                "marginBottom": 0.55,
+                "marginLeft": 0.65,
+                "marginRight": 0.65,
+                "displayHeaderFooter": false,
+                "preferCSSPageSize": true
+            }),
+            Duration::from_secs(20),
+        )
+        .await?;
+    let data = pdf["data"].as_str().ok_or("Chrome did not return a PDF.")?;
+    let cleaned: String = data.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(cleaned)
+        .map_err(|e| format!("Could not read the PDF: {e}"))?;
+    if !bytes.starts_with(b"%PDF") {
+        return Err("Chrome returned something that is not a PDF.".into());
+    }
+    Ok(bytes)
+}
+
+fn chrome_file_arg(path: &Path) -> Result<String, String> {
+    if !path.is_file() {
+        return Err("That document is missing from disk.".into());
+    }
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let text = canonical.to_string_lossy().to_string();
+    let text = text.trim_start_matches(r"\\?\").to_string();
+    if text.is_empty() {
+        return Err("That document path is empty.".into());
+    }
+    Ok(text)
+}
+
+pub fn describe_file_targets(targets: &[FileTarget]) -> String {
+    if targets.is_empty() {
+        return "file targets: none. If an Upload button is visible, call docs_attach with its click_index.".into();
+    }
+    let mut lines = vec!["file targets (use these with docs_attach, not the gold click indexes):".into()];
+    for target in targets {
+        let mut line = format!("[{} {}]", target.kind, target.index);
+        if !target.label.is_empty() {
+            line.push_str(&format!(" \"{}\"", target.label.replace('"', "'")));
+        }
+        if !target.accept.is_empty() {
+            line.push_str(&format!(" accept={}", target.accept));
+        }
+        if target.hidden {
+            line.push_str(" hidden");
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+pub fn choose_file_input<'a>(
+    targets: &'a [FileTarget],
+    kind: &str,
+    explicit: Option<i64>,
+) -> Result<&'a FileTarget, String> {
+    let files: Vec<&FileTarget> = targets.iter().filter(|target| target.kind == "file").collect();
+    if let Some(index) = explicit {
+        return files
+            .into_iter()
+            .find(|target| target.index == index)
+            .ok_or_else(|| format!("There is no file input [{index}]."));
+    }
+    if files.len() == 1 {
+        return Ok(files[0]);
+    }
+    if files.is_empty() {
+        return Err("This page has no file input.".into());
+    }
+    let needles: &[&str] = match kind {
+        "cover_letter" | "thank_you" => &["cover", "letter"],
+        "resume" => &["resume", "cv"],
+        _ => &[],
+    };
+    if let Some(hit) = files.iter().copied().find(|target| {
+        let hay = format!("{} {}", target.label, target.accept).to_lowercase();
+        needles.iter().any(|needle| !needle.is_empty() && hay.contains(needle))
+    }) {
+        return Ok(hit);
+    }
+    Err("Several file inputs are on the page. Pass file_index.".into())
+}
+
 fn separate_profile_args(port: u16, dir: &Path) -> Vec<String> {
     vec![
         format!("--remote-debugging-port={port}"),
@@ -1412,6 +1749,93 @@ pub fn jpeg_size(data: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
+const FILE_CENSUS_JS: &str = r#"(function(){
+  function labelFor(el) {
+    var label = '';
+    try {
+      if (el.id && window.CSS && CSS.escape) {
+        var linked = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+        if (linked) label = linked.innerText || '';
+      }
+    } catch (e) {}
+    if (!label && el.closest) {
+      var parent = el.closest('label');
+      if (parent) label = parent.innerText || '';
+    }
+    if (!label) label = el.getAttribute('aria-label') || el.name || '';
+    return String(label).replace(/\s+/g, ' ').trim().slice(0, 90);
+  }
+  function classText(el) {
+    var name = el.className;
+    if (name && name.baseVal !== undefined) name = name.baseVal;
+    return String(name || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('data-testid') || '');
+  }
+  function isDrop(el) {
+    var tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'BUTTON' || tag === 'A' || tag === 'TEXTAREA' || tag === 'SELECT') return false;
+    var hint = classText(el).toLowerCase();
+    if (/dropzone|drop-zone|file-drop|filedrop|drag-drop|dragdrop/.test(hint)) return true;
+    var text = String(el.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!text || text.length > 160) return false;
+    return text.indexOf('drag') >= 0 && (text.indexOf('drop') >= 0 || text.indexOf('upload') >= 0 || text.indexOf('file') >= 0);
+  }
+  var files = [];
+  var drops = [];
+  var seen = [];
+  function seenHas(el) {
+    for (var i = 0; i < seen.length; i++) if (seen[i] === el) return true;
+    return false;
+  }
+  function walk(root) {
+    if (!root || !root.querySelectorAll || files.length > 12) return;
+    var inputs = root.querySelectorAll('input[type="file"]');
+    for (var i = 0; i < inputs.length && files.length < 12; i++) {
+      if (!seenHas(inputs[i])) {
+        seen.push(inputs[i]);
+        files.push(inputs[i]);
+      }
+    }
+    var all = root.querySelectorAll('*');
+    for (var j = 0; j < all.length; j++) {
+      var el = all[j];
+      if (drops.length < 6 && isDrop(el) && !seenHas(el)) {
+        var rect = el.getBoundingClientRect();
+        if (rect.width >= 80 && rect.height >= 28) {
+          seen.push(el);
+          drops.push(el);
+        }
+      }
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  }
+  function walkFrames(win, depth) {
+    if (!win || depth > 3) return;
+    try { walk(win.document); } catch (e) {}
+    var count = 0;
+    try { count = win.frames.length; } catch (e) { count = 0; }
+    for (var i = 0; i < count; i++) {
+      try { walkFrames(win.frames[i], depth + 1); } catch (e) {}
+    }
+  }
+  walkFrames(window, 0);
+  window.__wb_files = files;
+  window.__wb_drops = drops;
+  return {
+    files: files.map(function(el, i) {
+      var rect = el.getBoundingClientRect();
+      return {
+        i: i,
+        accept: el.accept || '',
+        label: labelFor(el),
+        hidden: rect.width < 4 || rect.height < 4
+      };
+    }),
+    drops: drops.map(function(el, i) {
+      return { i: i, text: String(el.innerText || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 90) };
+    })
+  };
+})()"#;
+
 const SNAPSHOT_JS: &str = r#"(function(){
   document.querySelectorAll('[data-wb]').forEach(function(el){ el.removeAttribute('data-wb'); });
   window.__wb_els = {};
@@ -1545,6 +1969,29 @@ mod tests {
     use super::jpeg_size;
     use base64::Engine;
     use std::time::Duration;
+
+    #[test]
+    fn picks_the_resume_input_when_several_exist() {
+        let targets = vec![
+            super::FileTarget {
+                index: 0,
+                kind: "file".into(),
+                label: "Cover letter".into(),
+                accept: ".pdf".into(),
+                hidden: false,
+            },
+            super::FileTarget {
+                index: 1,
+                kind: "file".into(),
+                label: "Upload resume".into(),
+                accept: ".pdf,.docx".into(),
+                hidden: true,
+            },
+        ];
+        let chosen = super::choose_file_input(&targets, "resume", None).unwrap();
+        assert_eq!(chosen.index, 1);
+        assert!(super::describe_file_targets(&targets).contains("[file 1]"));
+    }
 
     #[test]
     fn reads_jpeg_size() {
