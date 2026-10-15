@@ -1,5 +1,6 @@
 mod agent;
 mod browser;
+mod documents;
 mod gemini;
 mod memory;
 mod ollama;
@@ -8,20 +9,25 @@ mod stack;
 
 use agent::HistoryTurn;
 use browser::Browser;
+use documents::{ApplicantProfile, DocumentSnapshot, DocumentVault};
 use memory::{MemorySnapshot, MemoryVault};
 use settings::Settings;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_opener::OpenerExt;
 use tokio::sync::Mutex;
 
 struct AppState {
     settings_path: PathBuf,
     memory_path: PathBuf,
+    documents_path: PathBuf,
+    documents_dir: PathBuf,
     profile_dir: PathBuf,
     settings: Mutex<Settings>,
     memory: Mutex<MemoryVault>,
+    documents: Mutex<DocumentVault>,
     browser: Mutex<Browser>,
     running: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
@@ -102,6 +108,184 @@ async fn clear_learned_memories(state: State<'_, AppState>) -> Result<MemorySnap
     vault.clear_learned();
     vault.save(&state.memory_path)?;
     Ok(vault.snapshot())
+}
+
+#[tauri::command]
+async fn get_documents(state: State<'_, AppState>) -> Result<DocumentSnapshot, String> {
+    Ok(state.documents.lock().await.snapshot(&state.documents_dir))
+}
+
+#[tauri::command]
+async fn save_applicant_profile(
+    state: State<'_, AppState>,
+    profile: ApplicantProfile,
+) -> Result<DocumentSnapshot, String> {
+    let mut docs = state.documents.lock().await;
+    docs.set_profile(profile);
+    docs.save(&state.documents_path)?;
+    Ok(docs.snapshot(&state.documents_dir))
+}
+
+#[tauri::command]
+async fn add_document(
+    state: State<'_, AppState>,
+    name: String,
+    kind: String,
+    data_base64: String,
+) -> Result<DocumentSnapshot, String> {
+    let bytes = documents::decode_upload(&data_base64)?;
+    let mut docs = state.documents.lock().await;
+    docs.add_upload(&state.documents_dir, &name, &kind, &bytes)?;
+    docs.save(&state.documents_path)?;
+    Ok(docs.snapshot(&state.documents_dir))
+}
+
+#[tauri::command]
+async fn update_document_text(
+    state: State<'_, AppState>,
+    id: String,
+    text: String,
+) -> Result<DocumentSnapshot, String> {
+    let mut docs = state.documents.lock().await;
+    docs.update_text(&id, &text)?;
+    docs.save(&state.documents_path)?;
+    Ok(docs.snapshot(&state.documents_dir))
+}
+
+#[tauri::command]
+async fn delete_document(state: State<'_, AppState>, id: String) -> Result<DocumentSnapshot, String> {
+    let mut docs = state.documents.lock().await;
+    docs.delete(&state.documents_dir, &id)?;
+    docs.save(&state.documents_path)?;
+    Ok(docs.snapshot(&state.documents_dir))
+}
+
+#[tauri::command]
+async fn preview_document(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let path = state
+        .documents
+        .lock()
+        .await
+        .preview_path(&state.documents_dir, &id)?;
+    let text = path.to_string_lossy().to_string();
+    app.opener()
+        .open_path(text, None::<&str>)
+        .map_err(|e| format!("Could not open that document: {e}"))
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn draft_document(
+    state: State<'_, AppState>,
+    kind: String,
+    job_title: String,
+    company: String,
+    job_text: String,
+    source_id: Option<String>,
+    notes: Option<String>,
+) -> Result<DocumentSnapshot, String> {
+    let settings = state.settings.lock().await.clone();
+    if stack::uses_stack(&settings.model) || gemini::uses_google(&settings.model) {
+        if settings.gemma_api_key.is_empty() {
+            return Err("Add your Google AI Studio key in the sidebar first.".into());
+        }
+    } else if settings.api_key.is_empty() {
+        return Err("Add your Ollama API key in the sidebar first.".into());
+    }
+    let kind = documents::normalize_draft_kind(&kind);
+    let (profile, source) = {
+        let docs = state.documents.lock().await;
+        if !docs.has_material(source_id.as_deref()) {
+            return Err("Add a resume or fill in your summary before drafting.".into());
+        }
+        (docs.profile().clone(), docs.source_material(source_id.as_deref()))
+    };
+    let mut job_text = job_text.trim().to_string();
+    if job_text.is_empty() {
+        if let Ok(mut guard) = state.browser.try_lock() {
+            if let Ok(page_text) = guard.read_text(8000).await {
+                job_text = page_text;
+            }
+        }
+    }
+    let cancel = AtomicBool::new(false);
+    let body = documents::write_body(
+        &settings,
+        &profile,
+        &source,
+        &kind,
+        &job_title,
+        &company,
+        &job_text,
+        notes.as_deref().unwrap_or(""),
+        &cancel,
+    )
+    .await?;
+    let mut composed = documents::compose_document(&profile, &kind, &body, &job_title, &company);
+    if let Ok(mut guard) = state.browser.try_lock() {
+        if let Ok(pdf) = guard.render_html_pdf(&composed.html).await {
+            composed.pdf = pdf;
+        }
+    }
+    let mut docs = state.documents.lock().await;
+    docs.store_generated(&state.documents_dir, &composed, &kind, &job_title, &company)?;
+    docs.save(&state.documents_path)?;
+    Ok(docs.snapshot(&state.documents_dir))
+}
+
+#[tauri::command]
+async fn attach_document_now(
+    state: State<'_, AppState>,
+    id: String,
+    method: Option<String>,
+    format: Option<String>,
+) -> Result<String, String> {
+    if state.running.load(Ordering::SeqCst) {
+        return Err("Wait until the current run finishes.".into());
+    }
+    let kind = state.documents.lock().await.kind_of(&id)?;
+    let targets = state
+        .browser
+        .lock()
+        .await
+        .file_targets()
+        .await
+        .map_err(|_| "Start bot Chrome and open the application page first.".to_string())?;
+    let chosen_input = browser::choose_file_input(&targets, &kind, None).ok().cloned();
+    let accept = chosen_input
+        .as_ref()
+        .map(|target| target.accept.as_str())
+        .unwrap_or("");
+    let path = {
+        let docs = state.documents.lock().await;
+        let fmt = docs.select_format(&id, format.as_deref(), accept)?;
+        docs.absolute(&state.documents_dir, &id, &fmt)?
+    };
+    let mut guard = state.browser.lock().await;
+    match method.unwrap_or_else(|| "auto".into()).to_lowercase().as_str() {
+        "drop" => {
+            let drop = targets
+                .iter()
+                .find(|target| target.kind == "drop")
+                .ok_or("No drop zone is visible on the current page.")?;
+            guard.drop_file(Some(drop.index), None, None, &path).await
+        }
+        "upload" => {
+            let target = browser::choose_file_input(&targets, &kind, None)?;
+            guard.upload_file(target.index, &path).await
+        }
+        _ => {
+            if let Some(target) = chosen_input {
+                if let Ok(done) = guard.upload_file(target.index, &path).await {
+                    return Ok(done);
+                }
+            }
+            if let Some(drop) = targets.iter().find(|target| target.kind == "drop") {
+                return guard.drop_file(Some(drop.index), None, None, &path).await;
+            }
+            Err("No file input or drop zone was found on the active Chrome tab.".into())
+        }
+    }
 }
 
 #[tauri::command]
@@ -206,6 +390,9 @@ async fn run_agent(
         &state.browser,
         &state.memory,
         &state.memory_path,
+        &state.documents,
+        &state.documents_path,
+        &state.documents_dir,
         cancel.as_ref(),
         message,
         images,
@@ -229,16 +416,24 @@ pub fn run() {
             std::fs::create_dir_all(&dir).ok();
             let settings_path = dir.join("settings.json");
             let memory_path = dir.join("memory.json");
+            let documents_path = dir.join("documents.json");
+            let documents_dir = dir.join("documents");
+            std::fs::create_dir_all(&documents_dir).ok();
             let settings = Settings::load(&settings_path).normalized();
             let memory = MemoryVault::load(&memory_path);
             let _ = memory.save(&memory_path);
+            let documents = DocumentVault::load(&documents_path);
+            let _ = documents.save(&documents_path);
             let port = settings.debug_port;
             app.manage(AppState {
                 profile_dir: dir.join("chrome-profile"),
                 settings_path,
                 memory_path,
+                documents_path,
+                documents_dir,
                 settings: Mutex::new(settings),
                 memory: Mutex::new(memory),
+                documents: Mutex::new(documents),
                 browser: Mutex::new(Browser::new(port)),
                 running: Arc::new(AtomicBool::new(false)),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -252,6 +447,14 @@ pub fn run() {
             save_memory,
             delete_memory,
             clear_learned_memories,
+            get_documents,
+            save_applicant_profile,
+            add_document,
+            update_document_text,
+            delete_document,
+            preview_document,
+            draft_document,
+            attach_document_now,
             browser_status,
             launch_chrome,
             browser_quick_action,

@@ -4,9 +4,12 @@ import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
 import {
   AgentEvent,
+  ApplicantProfile,
   BrowserStatus,
   ChatMessage,
   defaultModel,
+  DocumentInfo,
+  DocumentSnapshot,
   isStackModel,
   MemoryItem,
   MemorySnapshot,
@@ -21,6 +24,16 @@ import {
 } from "./types";
 
 const STORAGE_KEY = "gemma-work-bot-transcript";
+
+const EMPTY_PROFILE: ApplicantProfile = {
+  fullName: "",
+  email: "",
+  phone: "",
+  location: "",
+  headline: "",
+  links: "",
+  summary: "",
+};
 
 const DEFAULT_MEMORY_SNAPSHOT: MemorySnapshot = {
   items: [
@@ -209,9 +222,47 @@ function toolLabel(name: string) {
       return "Learned memory";
     case "memory_search":
       return "Searched memory";
+    case "docs_list":
+      return "Checked documents";
+    case "docs_read":
+      return "Read document";
+    case "docs_draft":
+      return "Drafted document";
+    case "docs_attach":
+      return "Attached document";
     default:
       return name;
   }
+}
+
+function kindLabel(kind: string) {
+  switch (kind) {
+    case "resume":
+      return "Resume";
+    case "cover_letter":
+      return "Cover letter";
+    case "thank_you":
+      return "Thank-you note";
+    case "portfolio":
+      return "Portfolio";
+    case "writing_sample":
+      return "Writing sample";
+    default:
+      return "Document";
+  }
+}
+
+async function readBinaryBase64(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result ?? "");
+      const idx = text.indexOf(",");
+      resolve(idx >= 0 ? text.slice(idx + 1) : text);
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
 }
 
 function imageSrc(image: string) {
@@ -272,7 +323,23 @@ export default function App() {
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [booting, setBooting] = useState(true);
   const [thinkingOpen, setThinkingOpen] = useState<Record<string, boolean>>({});
-  const [activeTab, setActiveTab] = useState<"console" | "vault">("console");
+  const [activeTab, setActiveTab] = useState<"console" | "documents" | "vault">("console");
+  const [docSnap, setDocSnap] = useState<DocumentSnapshot>({
+    profile: EMPTY_PROFILE,
+    documents: [],
+  });
+  const [profileForm, setProfileForm] = useState<ApplicantProfile>(EMPTY_PROFILE);
+  const [uploadKind, setUploadKind] = useState("resume");
+  const [draftKind, setDraftKind] = useState("cover_letter");
+  const [draftRole, setDraftRole] = useState("");
+  const [draftCompany, setDraftCompany] = useState("");
+  const [draftJobText, setDraftJobText] = useState("");
+  const [draftSourceId, setDraftSourceId] = useState("");
+  const [draftNotes, setDraftNotes] = useState("");
+  const [drafting, setDrafting] = useState(false);
+  const [docDropOver, setDocDropOver] = useState(false);
+  const [editingDocId, setEditingDocId] = useState<string | null>(null);
+  const [editingDocText, setEditingDocText] = useState("");
   const [vaultFilter, setVaultFilter] = useState<"all" | "playbook" | "pitfall" | "preference" | "skill">("all");
   const [newMemKind, setNewMemKind] = useState<"playbook" | "pitfall" | "preference" | "skill">("playbook");
   const [newMemDomain, setNewMemDomain] = useState("*");
@@ -285,6 +352,7 @@ export default function App() {
   const runningRef = useRef(false);
   const connectingRef = useRef(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const docFileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     runningRef.current = running;
@@ -362,6 +430,21 @@ export default function App() {
     }
   }
 
+  async function refreshDocuments(syncProfile = false) {
+    if (!inTauri()) return;
+    try {
+      const snap = await invoke<DocumentSnapshot>("get_documents");
+      if (snap && Array.isArray(snap.documents)) {
+        setDocSnap(snap);
+        if (syncProfile && snap.profile) {
+          setProfileForm(snap.profile);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   useEffect(() => {
     if (!inTauri()) {
       setBooting(false);
@@ -385,14 +468,21 @@ export default function App() {
     };
     (async () => {
       try {
-        const [loaded, memSnap] = await Promise.all([
+        const [loaded, memSnap, docsLoaded] = await Promise.all([
           invoke<Settings>("get_settings"),
           invoke<MemorySnapshot>("get_memories"),
+          invoke<DocumentSnapshot>("get_documents").catch(() => null),
         ]);
         if (!alive) return;
         setSettings(loaded);
         if (memSnap && Array.isArray(memSnap.items)) {
           setMemories(memSnap);
+        }
+        if (docsLoaded && Array.isArray(docsLoaded.documents)) {
+          setDocSnap(docsLoaded);
+          if (docsLoaded.profile) {
+            setProfileForm(docsLoaded.profile);
+          }
         }
         await refresh();
       } catch (error) {
@@ -446,6 +536,7 @@ export default function App() {
           setRunning(false);
           void refresh();
           void refreshMemories();
+          void refreshDocuments(false);
         }
       });
       if (!alive) {
@@ -590,6 +681,122 @@ export default function App() {
     }
   }
 
+  async function handleSaveProfile(event?: React.FormEvent) {
+    event?.preventDefault();
+    setBanner("");
+    if (!inTauri()) {
+      setDocSnap((prev) => ({ ...prev, profile: profileForm }));
+      return;
+    }
+    try {
+      const snap = await invoke<DocumentSnapshot>("save_applicant_profile", {
+        profile: profileForm,
+      });
+      setDocSnap(snap);
+      setProfileForm(snap.profile);
+    } catch (error) {
+      setBanner(String(error));
+    }
+  }
+
+  async function handleAddDocuments(files: FileList | File[]) {
+    setBanner("");
+    const list = [...files].slice(0, 8);
+    for (const file of list) {
+      if (!inTauri()) continue;
+      try {
+        const dataBase64 = await readBinaryBase64(file);
+        const snap = await invoke<DocumentSnapshot>("add_document", {
+          name: file.name,
+          kind: uploadKind,
+          dataBase64,
+        });
+        setDocSnap(snap);
+      } catch (error) {
+        setBanner(String(error));
+        return;
+      }
+    }
+  }
+
+  async function handleSaveDocText(id: string) {
+    setBanner("");
+    if (!inTauri()) return;
+    try {
+      const snap = await invoke<DocumentSnapshot>("update_document_text", {
+        id,
+        text: editingDocText,
+      });
+      setDocSnap(snap);
+      setEditingDocId(null);
+    } catch (error) {
+      setBanner(String(error));
+    }
+  }
+
+  async function handleDeleteDocument(id: string) {
+    setBanner("");
+    if (!inTauri()) return;
+    try {
+      const snap = await invoke<DocumentSnapshot>("delete_document", { id });
+      setDocSnap(snap);
+      if (editingDocId === id) setEditingDocId(null);
+    } catch (error) {
+      setBanner(String(error));
+    }
+  }
+
+  async function handlePreviewDocument(id: string) {
+    setBanner("");
+    if (!inTauri()) return;
+    try {
+      await invoke("preview_document", { id });
+    } catch (error) {
+      setBanner(String(error));
+    }
+  }
+
+  async function handleDraftDocument(event: React.FormEvent) {
+    event.preventDefault();
+    if (!inTauri() || drafting) return;
+    setBanner("");
+    setDrafting(true);
+    try {
+      await invoke<DocumentSnapshot>("save_applicant_profile", {
+        profile: profileForm,
+      });
+      const snap = await invoke<DocumentSnapshot>("draft_document", {
+        kind: draftKind,
+        jobTitle: draftRole,
+        company: draftCompany,
+        jobText: draftJobText,
+        sourceId: draftSourceId || null,
+        notes: draftNotes || null,
+      });
+      setDocSnap(snap);
+      setDraftNotes("");
+    } catch (error) {
+      setBanner(String(error));
+    } finally {
+      setDrafting(false);
+    }
+  }
+
+  async function handleAttachNow(id: string, method: "upload" | "drop") {
+    if (!inTauri()) return;
+    setBanner("");
+    try {
+      const message = await invoke<string>("attach_document_now", {
+        id,
+        method,
+        format: null,
+      });
+      setBanner(message);
+    } catch (error) {
+      setBanner(String(error));
+    }
+  }
+
   async function addFiles(files: FileList | File[]) {
     const list = [...files].filter((file) => file.type.startsWith("image/")).slice(0, 4);
     const encoded = await Promise.all(list.map((file) => readImage(file)));
@@ -709,14 +916,22 @@ export default function App() {
             className={activeTab === "console" ? "nav-pill active" : "nav-pill"}
             onClick={() => setActiveTab("console")}
           >
-            <span>✦</span> Mission Console
+            <span>✦</span> Console
+          </button>
+          <button
+            type="button"
+            className={activeTab === "documents" ? "nav-pill active" : "nav-pill"}
+            onClick={() => setActiveTab("documents")}
+          >
+            <span>▤</span> Docs
+            <strong className="pill-count">{docSnap.documents.length}</strong>
           </button>
           <button
             type="button"
             className={activeTab === "vault" ? "nav-pill active" : "nav-pill"}
             onClick={() => setActiveTab("vault")}
           >
-            <span>◈</span> Memory Vault
+            <span>◈</span> Vault
             <strong className="pill-count">{memoryStats.totalMemories ?? memoryItems.length}</strong>
           </button>
         </div>
@@ -1018,7 +1233,358 @@ export default function App() {
           </div>
         )}
 
-        {activeTab === "vault" ? (
+        {activeTab === "documents" ? (
+          <div className="vault-view docs-view">
+            <div className="vault-grid">
+              <div className="docs-left">
+                <section className="card teach-card">
+                  <h3>Applicant Profile</h3>
+                  <p className="muted">
+                    Used on application forms and as the letterhead for generated documents.
+                  </p>
+                  <form className="teach-form" onSubmit={(e) => void handleSaveProfile(e)}>
+                    <div className="split">
+                      <label>
+                        Full name
+                        <input
+                          value={profileForm.fullName}
+                          placeholder="Ada Lovelace"
+                          onChange={(e) =>
+                            setProfileForm({ ...profileForm, fullName: e.target.value })
+                          }
+                          onBlur={() => void handleSaveProfile()}
+                        />
+                      </label>
+                      <label>
+                        Headline
+                        <input
+                          value={profileForm.headline}
+                          placeholder="Staff Software Engineer"
+                          onChange={(e) =>
+                            setProfileForm({ ...profileForm, headline: e.target.value })
+                          }
+                          onBlur={() => void handleSaveProfile()}
+                        />
+                      </label>
+                    </div>
+                    <div className="split">
+                      <label>
+                        Email
+                        <input
+                          value={profileForm.email}
+                          placeholder="you@example.com"
+                          onChange={(e) =>
+                            setProfileForm({ ...profileForm, email: e.target.value })
+                          }
+                          onBlur={() => void handleSaveProfile()}
+                        />
+                      </label>
+                      <label>
+                        Phone
+                        <input
+                          value={profileForm.phone}
+                          placeholder="+1 555 0100"
+                          onChange={(e) =>
+                            setProfileForm({ ...profileForm, phone: e.target.value })
+                          }
+                          onBlur={() => void handleSaveProfile()}
+                        />
+                      </label>
+                    </div>
+                    <div className="split">
+                      <label>
+                        Location
+                        <input
+                          value={profileForm.location}
+                          placeholder="Boston, MA"
+                          onChange={(e) =>
+                            setProfileForm({ ...profileForm, location: e.target.value })
+                          }
+                          onBlur={() => void handleSaveProfile()}
+                        />
+                      </label>
+                      <label>
+                        Links
+                        <input
+                          value={profileForm.links}
+                          placeholder="github.com/you · linkedin.com/in/you"
+                          onChange={(e) =>
+                            setProfileForm({ ...profileForm, links: e.target.value })
+                          }
+                          onBlur={() => void handleSaveProfile()}
+                        />
+                      </label>
+                    </div>
+                    <label>
+                      Summary &amp; key experience
+                      <textarea
+                        rows={4}
+                        value={profileForm.summary}
+                        placeholder="Real background, skills, and achievements to ground cover letters and answers…"
+                        onChange={(e) =>
+                          setProfileForm({ ...profileForm, summary: e.target.value })
+                        }
+                        onBlur={() => void handleSaveProfile()}
+                      />
+                    </label>
+                    <div className="teach-actions">
+                      <button type="submit" className="primary">
+                        Save profile
+                      </button>
+                    </div>
+                  </form>
+                </section>
+
+                <section className="card teach-card">
+                  <h3>Document Creator</h3>
+                  <p className="muted">
+                    Drafts a realistic PDF and DOCX grounded strictly in your stored resume and profile.
+                  </p>
+                  <form className="teach-form" onSubmit={(e) => void handleDraftDocument(e)}>
+                    <div className="split">
+                      <label>
+                        Document type
+                        <select
+                          value={draftKind}
+                          onChange={(e) => setDraftKind(e.target.value)}
+                        >
+                          <option value="cover_letter">Cover letter</option>
+                          <option value="thank_you">Thank-you note</option>
+                          <option value="resume">Tailored resume</option>
+                          <option value="other">Application note</option>
+                        </select>
+                      </label>
+                      <label>
+                        Ground on file
+                        <select
+                          value={draftSourceId}
+                          onChange={(e) => setDraftSourceId(e.target.value)}
+                        >
+                          <option value="">Primary resume</option>
+                          {docSnap.documents.map((doc) => (
+                            <option key={doc.id} value={doc.id}>
+                              {doc.title}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <div className="split">
+                      <label>
+                        Role
+                        <input
+                          value={draftRole}
+                          placeholder="Senior Systems Engineer"
+                          onChange={(e) => setDraftRole(e.target.value)}
+                        />
+                      </label>
+                      <label>
+                        Company
+                        <input
+                          value={draftCompany}
+                          placeholder="Acme"
+                          onChange={(e) => setDraftCompany(e.target.value)}
+                        />
+                      </label>
+                    </div>
+                    <label>
+                      Job description (leave blank to read the active Chrome tab)
+                      <textarea
+                        rows={4}
+                        value={draftJobText}
+                        placeholder="Paste the job posting, or leave empty to pull from the open job tab…"
+                        onChange={(e) => setDraftJobText(e.target.value)}
+                      />
+                    </label>
+                    <label>
+                      Angle or notes
+                      <input
+                        value={draftNotes}
+                        placeholder="Optional: highlight distributed systems work"
+                        onChange={(e) => setDraftNotes(e.target.value)}
+                      />
+                    </label>
+                    <div className="teach-actions">
+                      <button type="submit" className="primary" disabled={drafting}>
+                        {drafting ? "Drafting PDF & DOCX…" : "Draft PDF & DOCX"}
+                      </button>
+                    </div>
+                  </form>
+                </section>
+              </div>
+
+              <section className="vault-list-section">
+                <div
+                  className={docDropOver ? "doc-drop over" : "doc-drop"}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setDocDropOver(true);
+                  }}
+                  onDragLeave={() => setDocDropOver(false)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setDocDropOver(false);
+                    if (e.dataTransfer.files?.length) {
+                      void handleAddDocuments(e.dataTransfer.files);
+                    }
+                  }}
+                >
+                  <div>
+                    <strong>Document Holder</strong>
+                    <p className="muted">
+                      Drop your resume, portfolio, or writing sample here (PDF, DOCX, TXT, MD, RTF, HTML).
+                    </p>
+                  </div>
+                  <div className="doc-drop-controls">
+                    <select
+                      aria-label="Document kind"
+                      value={uploadKind}
+                      onChange={(e) => setUploadKind(e.target.value)}
+                    >
+                      <option value="resume">Resume</option>
+                      <option value="cover_letter">Cover letter</option>
+                      <option value="portfolio">Portfolio</option>
+                      <option value="writing_sample">Writing sample</option>
+                      <option value="other">Other</option>
+                    </select>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => docFileRef.current?.click()}
+                    >
+                      Choose file
+                    </button>
+                    <input
+                      ref={docFileRef}
+                      type="file"
+                      accept=".pdf,.docx,.doc,.txt,.md,.rtf,.html,.htm"
+                      multiple
+                      hidden
+                      onChange={(e) => {
+                        if (e.target.files?.length) {
+                          void handleAddDocuments(e.target.files);
+                        }
+                        e.target.value = "";
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="vault-cards">
+                  {docSnap.documents.length === 0 ? (
+                    <div className="card empty-vault">
+                      <p>
+                        No documents stored yet. Add your resume above so WorkBot can upload it and draft tailored cover letters during job applications.
+                      </p>
+                    </div>
+                  ) : (
+                    docSnap.documents.map((doc: DocumentInfo) => (
+                      <article key={doc.id} className="card memory-card">
+                        <div className="memory-card-top">
+                          <span className={`kind-badge ${doc.kind}`}>
+                            {kindLabel(doc.kind)}
+                          </span>
+                          <span className="domain-tag">
+                            {doc.source === "generated" ? "Generated" : doc.originalName || "Uploaded"}
+                          </span>
+                          {doc.hasPdf && <span className="domain-tag">PDF</span>}
+                          {doc.hasDocx && <span className="domain-tag">DOCX</span>}
+                          <span className="memory-meta">
+                            {doc.text ? `${doc.text.length} chars` : "No extracted text"}
+                          </span>
+                        </div>
+                        <h4>{doc.title}</h4>
+                        {(doc.jobTitle || doc.company) && (
+                          <p className="muted">
+                            {[doc.jobTitle, doc.company].filter(Boolean).join(" · ")}
+                          </p>
+                        )}
+                        {editingDocId === doc.id ? (
+                          <div className="teach-form">
+                            <textarea
+                              rows={6}
+                              value={editingDocText}
+                              placeholder="Paste the plain text of this document so the bot can read every detail…"
+                              onChange={(e) => setEditingDocText(e.target.value)}
+                            />
+                            <div className="teach-actions">
+                              <button
+                                type="button"
+                                className="primary mini-btn"
+                                onClick={() => void handleSaveDocText(doc.id)}
+                              >
+                                Save text
+                              </button>
+                              <button
+                                type="button"
+                                className="ghost mini-btn"
+                                onClick={() => setEditingDocId(null)}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <p>
+                            {doc.text
+                              ? doc.text.slice(0, 320) + (doc.text.length > 320 ? "…" : "")
+                              : "Scanned or binary file without extracted text. Click Edit text to paste a copy for tailoring."}
+                          </p>
+                        )}
+                        <div className="memory-card-foot">
+                          <div className="tag-list">
+                            <button
+                              type="button"
+                              className="ghost mini-btn"
+                              onClick={() => void handlePreviewDocument(doc.id)}
+                            >
+                              Open file
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost mini-btn"
+                              disabled={running}
+                              onClick={() => void handleAttachNow(doc.id, "upload")}
+                            >
+                              Upload to tab
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost mini-btn"
+                              disabled={running}
+                              onClick={() => void handleAttachNow(doc.id, "drop")}
+                            >
+                              Drop on tab
+                            </button>
+                          </div>
+                          <div className="memory-actions">
+                            <button
+                              type="button"
+                              className="texty"
+                              onClick={() => {
+                                setEditingDocId(doc.id);
+                                setEditingDocText(doc.text);
+                              }}
+                            >
+                              Edit text
+                            </button>
+                            <button
+                              type="button"
+                              className="texty danger-text"
+                              onClick={() => void handleDeleteDocument(doc.id)}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      </article>
+                    ))
+                  )}
+                </div>
+              </section>
+            </div>
+          </div>
+        ) : activeTab === "vault" ? (
           <div className="vault-view">
             <section className="vault-stats">
               <div className="stat-card">
@@ -1241,6 +1807,16 @@ export default function App() {
                       }
                     >
                       <span>◈</span> Learn &amp; map this website
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setDraft(
+                          "Apply to the job on this page using my stored resume and profile, draft a tailored cover letter with docs_draft if needed, attach the files with docs_attach, and verify with browser_review before submitting.",
+                        )
+                      }
+                    >
+                      <span>▤</span> Apply with stored resume &amp; cover letter
                     </button>
                   </div>
 

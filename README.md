@@ -20,6 +20,7 @@ Gemma is a trademark of Google LLC.
 ## Features
 
 - **ARGON-Standard Autonomous Harnessing** — Dual Pure Google stack modes (*All-Google Stack* with Flash + Argon escalation, or *Argon Apex Stack* with Gemini 4 Argon primary orchestration)
+- **Document Holder & On-the-Fly Document Creator** — Store your resume, profile, and samples in the local holder; generate tailored PDF and DOCX cover letters, thank-you notes, or resumes grounded strictly in your real background (`docs_list`, `docs_read`, `docs_draft`); and attach them to job boards via file input upload, drag-and-drop drop zones, or native file choosers (`docs_attach`)
 - **Continuous Self-Learning & Memory Vault** — Automatically learns and persists domain-specific site playbooks, UI pitfall workarounds, user preferences, and 1-click reusable skills (`memory_save`, `memory_search`, trajectory reflection, and automatic `[memory-vault]` recall)
 - **Full-Page + Open Shadow DOM Visual Scan** — Traverses both light DOM and open Shadow DOM roots before acting
 - **Rich Browser Tooling** — Clicking, typing, keyboard chords (`browser_key_combo`), drag-and-drop (`browser_drag`), structured table/link/heading extraction (`browser_extract`), forms, tabs, and navigation

@@ -68,6 +68,36 @@ export type MemorySnapshot = {
   stats: MemoryStats;
 };
 
+export type ApplicantProfile = {
+  fullName: string;
+  email: string;
+  phone: string;
+  location: string;
+  headline: string;
+  links: string;
+  summary: string;
+};
+
+export type DocumentInfo = {
+  id: string;
+  title: string;
+  kind: "resume" | "cover_letter" | "thank_you" | "portfolio" | "writing_sample" | "other" | string;
+  source: "uploaded" | "generated" | string;
+  originalName: string;
+  hasPdf: boolean;
+  hasDocx: boolean;
+  hasOriginal: boolean;
+  text: string;
+  jobTitle: string;
+  company: string;
+  createdAt: number;
+};
+
+export type DocumentSnapshot = {
+  profile: ApplicantProfile;
+  documents: DocumentInfo[];
+};
+
 export type TelemetryState = {
   step: number;
   maxSteps: number;
