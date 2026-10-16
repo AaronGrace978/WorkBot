@@ -422,7 +422,7 @@ impl MemoryVault {
                 "skill",
                 "*",
                 "Form Autopilot with Pre-Submit Verification",
-                "Locate every form input, dropdown, and checkbox on the current page. Populate all fields accurately from my instructions, run browser_review to verify zero mismatches, and submit.",
+                "Map every field on the current page with browser_fields, fill them all from my instructions in one browser_fill_form call, fix any field that failed, run browser_review to verify zero mismatches, and submit.",
                 vec!["form", "review", "submit", "autofill"],
             ),
             (

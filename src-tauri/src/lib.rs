@@ -1,6 +1,7 @@
 mod agent;
 mod browser;
 mod documents;
+mod dom;
 mod gemini;
 mod memory;
 mod ollama;

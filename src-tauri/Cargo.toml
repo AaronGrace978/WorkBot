@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "0.4.1"
+version = "0.5.0"
 description = "Gemma Work Bot"
 authors = ["you"]
 edition = "2021"

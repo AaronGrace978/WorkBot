@@ -1,4 +1,4 @@
-use crate::browser::{choose_file_input, Browser};
+use crate::browser::{choose_file_input, Browser, FieldSpec};
 use crate::documents::{self, DocumentVault};
 use crate::memory::{extract_domain, MemoryItem, MemoryVault};
 use crate::ollama::{self, arg_bool, arg_f64, arg_i64, arg_string, ChatMessage, ToolCall, ToolFunction};
@@ -445,6 +445,22 @@ pub async fn run(
                         arg_i64(&call.function.arguments, "index"),
                         arg_f64(&call.function.arguments, "x"),
                         arg_f64(&call.function.arguments, "y"),
+                        None,
+                    )
+                    .await
+                    .unwrap_or(false)
+            } else if name == "browser_dom_edit"
+                && arg_string(&call.function.arguments, "action").as_deref() == Some("js_click")
+            {
+                let selector = arg_string(&call.function.arguments, "selector");
+                browser
+                    .lock()
+                    .await
+                    .is_final_action_target(
+                        arg_i64(&call.function.arguments, "index"),
+                        None,
+                        None,
+                        selector.as_deref(),
                     )
                     .await
                     .unwrap_or(false)
@@ -502,8 +518,12 @@ pub async fn run(
                     reviewed_since_change = true;
                 } else if matches!(
                     name.as_str(),
-                    "browser_type" | "browser_select" | "browser_drag" | "docs_attach"
-                ) || (name == "browser_click" && !is_final_action)
+                    "browser_type"
+                        | "browser_select"
+                        | "browser_fill_form"
+                        | "browser_drag"
+                        | "docs_attach"
+                ) || (matches!(name.as_str(), "browser_click" | "browser_dom_edit") && !is_final_action)
                 {
                     reviewed_since_change = false;
                 }
@@ -970,7 +990,35 @@ async fn dispatch(browser: &Mutex<Browser>, call: &ToolCall) -> Result<String, S
         "browser_scroll" => {
             let dy = arg_f64(args, "dy").unwrap_or(600.0);
             let dx = arg_f64(args, "dx").unwrap_or(0.0);
-            guard.scroll(dx, dy, arg_f64(args, "x"), arg_f64(args, "y")).await
+            guard
+                .scroll(dx, dy, arg_f64(args, "x"), arg_f64(args, "y"), arg_i64(args, "index"))
+                .await
+        }
+        "browser_fields" => guard.form_fields().await,
+        "browser_fill_form" => {
+            let specs = parse_fields(args)?;
+            guard.fill_form(&specs).await.map(|(text, _)| text)
+        }
+        "browser_inspect" => {
+            let selector = arg_string(args, "selector");
+            let max = arg_i64(args, "max_chars").unwrap_or(12000).clamp(1000, 30000) as usize;
+            guard.inspect(arg_i64(args, "index"), selector.as_deref(), max).await
+        }
+        "browser_dom_edit" => {
+            let action = arg_string(args, "action").ok_or("browser_dom_edit needs an action.")?;
+            let selector = arg_string(args, "selector");
+            let attr = arg_string(args, "name");
+            let value = args.get("value").map(scalar_text);
+            guard
+                .dom_edit(
+                    &action,
+                    arg_i64(args, "index"),
+                    selector.as_deref(),
+                    attr.as_deref(),
+                    value.as_deref(),
+                    arg_bool(args, "all"),
+                )
+                .await
         }
         "browser_navigate" => {
             let url = arg_string(args, "url").ok_or("browser_navigate needs a url.")?;
@@ -1016,6 +1064,49 @@ async fn dispatch(browser: &Mutex<Browser>, call: &ToolCall) -> Result<String, S
     }
 }
 
+fn scalar_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        Value::Array(items) => items.iter().map(scalar_text).collect::<Vec<_>>().join(" | "),
+        other => other.to_string(),
+    }
+}
+
+/// Accepts `fields` as a list of `{index|selector|label, value}`, the same list
+/// encoded as a JSON string, or a `{index or label: value}` object.
+fn parse_fields(args: &Value) -> Result<Vec<FieldSpec>, String> {
+    let items: Vec<Value> = match args.get("fields") {
+        Some(Value::Array(items)) => items.clone(),
+        Some(Value::String(raw)) => serde_json::from_str(raw)
+            .map_err(|_| "fields must be a list of {index, value} objects.".to_string())?,
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(key, value)| match key.trim().parse::<i64>() {
+                Ok(index) => json!({ "index": index, "value": value }),
+                Err(_) => json!({ "label": key, "value": value }),
+            })
+            .collect(),
+        _ => return Err("browser_fill_form needs fields: a list of {index, value} objects.".into()),
+    };
+    let mut specs = Vec::with_capacity(items.len());
+    for item in &items {
+        let index = arg_i64(item, "index");
+        let selector = arg_string(item, "selector");
+        let label = arg_string(item, "label");
+        if index.is_none() && selector.is_none() && label.is_none() {
+            return Err("Each field needs an index (preferred), a CSS selector, or a label.".into());
+        }
+        let value = item
+            .get("value")
+            .or_else(|| item.get("text"))
+            .map(scalar_text)
+            .ok_or("Each field needs a value.")?;
+        specs.push(FieldSpec { index, selector, label, value });
+    }
+    Ok(specs)
+}
+
 fn changes_page(name: &str) -> bool {
     matches!(
         name,
@@ -1033,7 +1124,9 @@ fn changes_page(name: &str) -> bool {
             | "browser_forward"
             | "browser_reload"
             | "browser_select"
-            |         "browser_review"
+            | "browser_fill_form"
+            | "browser_dom_edit"
+            | "browser_review"
             | "browser_switch_tab"
             | "browser_new_tab"
             | "browser_close_tab"
@@ -1058,6 +1151,10 @@ const KNOWN_TOOLS: &[&str] = &[
     "browser_select",
     "browser_read",
     "browser_extract",
+    "browser_fields",
+    "browser_fill_form",
+    "browser_inspect",
+    "browser_dom_edit",
     "browser_review",
     "browser_tabs",
     "browser_switch_tab",
@@ -1226,7 +1323,7 @@ fn tool_schema() -> Value {
                 "click_count":{"type":"integer","description":"2 for a double click"}
             }
         })),
-        tool("browser_type", "Click a form field and type text into it.", json!({
+        tool("browser_type", "Click one field and type into it with real keystrokes. Use it for search boxes and fields that react to typing; use browser_fill_form for regular form fields.", json!({
             "type":"object",
             "required":["text"],
             "properties":{
@@ -1263,9 +1360,55 @@ fn tool_schema() -> Value {
                 "to_y":{"type":"number"}
             }
         })),
-        tool("browser_scroll", "Scroll the page. Positive dy scrolls down.", json!({
+        tool("browser_scroll", "Scroll to read content. Positive dy scrolls down; x,y scroll an inner panel under that point; index brings that element to the middle of the screen. The result says where you are on the page. Never scroll just to reach a field that already has an index.", json!({
             "type":"object",
-            "properties":{"dx":{"type":"number"},"dy":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"}}
+            "properties":{
+                "dx":{"type":"number"},
+                "dy":{"type":"number"},
+                "x":{"type":"number"},
+                "y":{"type":"number"},
+                "index":{"type":"integer","description":"Element to bring into view instead of scrolling by an amount"}
+            }
+        })),
+        tool("browser_fields", "Map every fillable field on the page, like opening F12 DevTools: index, type, label, required, current value, options or choices, validation errors, sections, and buttons. Covers fields above and below the screen, Shadow DOM, and same-origin iframes.", json!({"type":"object","properties":{}})),
+        tool("browser_fill_form", "Fill many fields in one call, without scrolling. Works for text, email, phone, number, date, time, textarea, select, multi-select (separate values with |), radio groups (value is the choice text), checkboxes (true or false), rich-text editors, and custom dropdowns or autocompletes. Every value is verified; failures explain why and list the valid choices.", json!({
+            "type":"object",
+            "required":["fields"],
+            "properties":{
+                "fields":{
+                    "type":"array",
+                    "items":{
+                        "type":"object",
+                        "required":["value"],
+                        "properties":{
+                            "index":{"type":"integer","description":"Field index from the FORM MAP (preferred)"},
+                            "selector":{"type":"string","description":"CSS selector, when the field has no index"},
+                            "label":{"type":"string","description":"Visible label text, when there is no index or selector"},
+                            "value":{"type":"string","description":"Text to enter, option or choice text, or true/false for a checkbox"}
+                        }
+                    }
+                }
+            }
+        })),
+        tool("browser_inspect", "Read the live HTML like the F12 Elements panel: the main form by default, or the element at an index or CSS selector. Shows attributes, current values, hidden, readonly, or disabled state, Shadow DOM, and same-origin iframes. data-wb=\"N\" in the output is the index to use.", json!({
+            "type":"object",
+            "properties":{
+                "index":{"type":"integer"},
+                "selector":{"type":"string","description":"CSS selector of the part to inspect"},
+                "max_chars":{"type":"integer"}
+            }
+        })),
+        tool("browser_dom_edit", "Edit the live page like the F12 Elements panel to unblock a form: remove_attribute (readonly, disabled, maxlength), set_attribute, set_style, show a hidden field, hide or remove an overlay covering the form, set_text, focus, scroll_into_view, or js_click an element that is covered. Only to complete the user's task; never to get around payments, security checks, or CAPTCHAs.", json!({
+            "type":"object",
+            "required":["action"],
+            "properties":{
+                "action":{"type":"string","enum":["set_attribute","remove_attribute","set_style","show","hide","remove","set_text","focus","scroll_into_view","js_click"]},
+                "index":{"type":"integer"},
+                "selector":{"type":"string"},
+                "name":{"type":"string","description":"Attribute or CSS property name"},
+                "value":{"type":"string","description":"Attribute value, CSS value, or text"},
+                "all":{"type":"boolean","description":"Apply to every selector match (up to 50)"}
+            }
         })),
         tool("browser_navigate", "Open an http or https URL in the current tab.", json!({
             "type":"object",
@@ -1275,7 +1418,7 @@ fn tool_schema() -> Value {
         tool("browser_back", "Go back in the tab history.", json!({"type":"object","properties":{}})),
         tool("browser_forward", "Go forward in the tab history.", json!({"type":"object","properties":{}})),
         tool("browser_reload", "Reload the current page.", json!({"type":"object","properties":{}})),
-        tool("browser_select", "Choose an option in a select element by visible label or value.", json!({
+        tool("browser_select", "Choose one option in a dropdown (native select or custom) by visible label or value.", json!({
             "type":"object",
             "required":["index","label"],
             "properties":{"index":{"type":"integer"},"label":{"type":"string"}}
@@ -1415,10 +1558,13 @@ How to work:
 - Read the user's entire original prompt before planning. Inspect attached/reference images carefully: compare text, layout, colors, counts, selections, and other visible details instead of making a quick guess.
 - Think about what is on screen, compare it to the original prompt and reference images, then act with a tool. Every reply should include a tool call until the task is finished.
 - Prefer browser_click with an index. Use x and y only when the target is not listed. Coordinates are screenshot pixels from the top left.
-- To fill a form, browser_type into each field (clear true to replace existing text) and use browser_select for dropdowns. Use browser_key_combo for shortcuts (like Control+A or Shift+Tab) and browser_extract for structured tables/links.
+- Indexes belong to elements, not screen positions. An element keeps its index until the page is replaced, even after scrolling or new observations. Clicking, typing, or filling an index scrolls to it only if it is off screen, so never scroll up and down hunting for a field. Scroll only to read content or reveal things that have no index yet; each scroll result says where you are on the page.
+- Forms: each scan includes a FORM MAP, and browser_fields refreshes it. Fill the whole form, or the whole current step of a multi-step form, with ONE browser_fill_form call using the field indexes. It handles text, dates, selects, radios (value is the choice text), checkboxes (true or false), and custom dropdowns, including fields above or below the screen. Read the result and fix every FAILED field using the choices it lists. Fields that appear only after an answer (for example State after Country) show up in the next observation; fill them next.
+- When a field or widget is confusing (custom dropdown, date picker, hidden input, unclear label), call browser_inspect to read its HTML the way a developer would in F12, then target the right element by index or CSS selector. If the page blocks a legitimate entry (readonly or disabled attribute, maxlength cut-off, an overlay covering the form), fix it with browser_dom_edit and fill again.
+- Use browser_type for search boxes and fields that need real keystrokes (clear true replaces existing text), browser_key_combo for shortcuts (like Control+A or Shift+Tab), and browser_extract for structured tables/links.
 - REQUIRED BEFORE FINAL ACTION: before clicking Submit, Send, Save, Confirm, Finish, Publish, Post, payment, or creating an account, call browser_review. Re-read the original user prompt, compare every reported field and the fresh screenshot against it, and correct every mismatch. Only then perform the final action. Final actions are blocked until this review occurs.
 - Do not use browser_type submit=true or press Enter to submit a final form before browser_review.
-- If the page is loading, call wait. If something is below the screen, scroll. To read a long page, call browser_read.
+- If the page is loading, call wait. To read a long page, call browser_read instead of scrolling through it.
 - After each action you get a new screenshot. Trust it over your memory. If an action did nothing, try a different approach instead of repeating it.
 - Close cookie banners and popups that block the page.
 - When the whole task is finished, call task_done with a short summary of what you did and any answer the user asked for, plus an optional `lesson` to remember for next time. Put the answer in the summary rather than writing it twice.
@@ -1459,6 +1605,30 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "browser_click");
         assert_eq!(arg_i64(&calls[0].function.arguments, "index"), Some(3));
+    }
+
+    #[test]
+    fn parses_fill_form_fields_in_every_shape() {
+        let list = parse_fields(&json!({"fields": [
+            {"index": 12, "value": "Ada"},
+            {"label": "Agree", "value": true},
+            {"selector": "#langs", "value": ["English", "French"]}
+        ]}))
+        .unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].index, Some(12));
+        assert_eq!(list[1].value, "true");
+        assert_eq!(list[2].value, "English | French");
+
+        let encoded = parse_fields(&json!({"fields": "[{\"index\": \"7\", \"value\": 42}]"})).unwrap();
+        assert_eq!((encoded[0].index, encoded[0].value.as_str()), (Some(7), "42"));
+
+        let object = parse_fields(&json!({"fields": {"3": "x", "Last name": "Lovelace"}})).unwrap();
+        assert!(object.iter().any(|f| f.index == Some(3)));
+        assert!(object.iter().any(|f| f.label.as_deref() == Some("Last name")));
+
+        assert!(parse_fields(&json!({"fields": [{"value": "orphan"}]})).is_err());
+        assert!(parse_fields(&json!({})).is_err());
     }
 
     #[test]

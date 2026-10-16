@@ -56,7 +56,7 @@ const DEFAULT_MEMORY_SNAPSHOT: MemorySnapshot = {
       domain: "*",
       title: "Form Autopilot with Pre-Submit Verification",
       content:
-        "Locate every form input, dropdown, and checkbox on the current page. Populate all fields accurately from my instructions, run browser_review to verify zero mismatches, and submit.",
+        "Map every field on the current page with browser_fields, fill them all from my instructions in one browser_fill_form call, fix any field that failed, run browser_review to verify zero mismatches, and submit.",
       tags: ["form", "review", "submit"],
       uses: 0,
       confidence: 95,
@@ -206,6 +206,14 @@ function toolLabel(name: string) {
       return "Read page";
     case "browser_extract":
       return "Extracted data";
+    case "browser_fields":
+      return "Mapped form";
+    case "browser_fill_form":
+      return "Filled form";
+    case "browser_inspect":
+      return "Inspected HTML";
+    case "browser_dom_edit":
+      return "Edited page";
     case "browser_review":
       return "Reviewed form";
     case "browser_tabs":
@@ -1792,7 +1800,7 @@ export default function App() {
                       type="button"
                       onClick={() =>
                         setDraft(
-                          "Complete the form on this page using my instructions, review every field with browser_review, then submit it.",
+                          "Complete the form on this page using my instructions: fill every field with browser_fill_form, review it with browser_review, then submit it.",
                         )
                       }
                     >

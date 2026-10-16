@@ -1,3 +1,4 @@
+use crate::dom;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -69,6 +70,79 @@ struct Frame {
     img_h: f64,
     css_w: f64,
     css_h: f64,
+    /// The screenshot covers the whole page, so its pixels are page
+    /// coordinates rather than viewport coordinates.
+    page: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldSpec {
+    pub index: Option<i64>,
+    pub selector: Option<String>,
+    pub label: Option<String>,
+    pub value: String,
+}
+
+struct Target {
+    x: f64,
+    y: f64,
+    label: String,
+    blocker: String,
+}
+
+fn spec_target(spec: &FieldSpec) -> String {
+    if let Some(index) = spec.index {
+        format!("[{index}]")
+    } else if let Some(selector) = &spec.selector {
+        selector.clone()
+    } else {
+        format!("\"{}\"", spec.label.as_deref().unwrap_or(""))
+    }
+}
+
+fn merge(into: &mut Value, from: Value) {
+    if let (Some(into), Value::Object(from)) = (into.as_object_mut(), from) {
+        for (key, value) in from {
+            if !value.is_null() {
+                into.insert(key, value);
+            }
+        }
+    }
+}
+
+fn scroll_key(info: &Value) -> (i64, i64, i64, i64) {
+    (
+        info["y"].as_i64().unwrap_or(0),
+        info["x"].as_i64().unwrap_or(0),
+        info["inner"]["top"].as_i64().unwrap_or(0),
+        info["inner"]["left"].as_i64().unwrap_or(0),
+    )
+}
+
+fn scroll_line(info: &Value) -> String {
+    let vh = info["vh"].as_f64().unwrap_or(800.0);
+    describe_scroll(
+        info["y"].as_f64().unwrap_or(0.0),
+        info["h"].as_f64().unwrap_or(vh),
+        vh,
+    )
+}
+
+pub fn describe_scroll(y: f64, height: f64, viewport: f64) -> String {
+    let below = (height - y - viewport).max(0.0);
+    let place = if height <= viewport + 2.0 {
+        "the whole page fits on screen".to_string()
+    } else if y <= 2.0 {
+        format!("top of the page, {below:.0} px more below")
+    } else if below <= 2.0 {
+        "bottom of the page".to_string()
+    } else {
+        format!("{y:.0} px above, {below:.0} px below")
+    };
+    format!(
+        "scroll: showing y={y:.0}–{:.0} of {height:.0} px ({place}).",
+        (y + viewport).min(height.max(viewport))
+    )
 }
 
 struct Cdp {
@@ -217,6 +291,7 @@ pub struct Browser {
     active_url: Option<String>,
     frame: Option<Frame>,
     http: reqwest::Client,
+    wb_next: u64,
 }
 
 impl Browser {
@@ -233,6 +308,7 @@ impl Browser {
             active_url: None,
             frame: None,
             http,
+            wb_next: 1,
         }
     }
 
@@ -311,65 +387,83 @@ impl Browser {
         self.with_connection().await?;
         let _ = self.conn_call("Page.bringToFront", json!({})).await;
         self.settle().await;
-        let scan = self.eval(FULL_SCAN_JS).await?;
-        let metrics = self
-            .conn_call("Page.getLayoutMetrics", json!({}))
-            .await
-            .unwrap_or(Value::Null);
-        let css_width = metrics["cssContentSize"]["width"]
-            .as_f64()
-            .or_else(|| scan["width"].as_f64())
-            .unwrap_or(1200.0)
-            .clamp(320.0, 2000.0);
-        let actual_height = metrics["cssContentSize"]["height"]
-            .as_f64()
-            .or_else(|| scan["height"].as_f64())
-            .unwrap_or(800.0)
-            .max(200.0);
-        let capture_height = actual_height.min(8000.0);
-        let shot = self
-            .conn_call(
-                "Page.captureScreenshot",
-                json!({
-                    "format": "jpeg",
-                    "quality": 72,
-                    "fromSurface": true,
-                    "captureBeyondViewport": true,
-                    "clip": {
-                        "x": 0,
-                        "y": 0,
-                        "width": css_width,
-                        "height": capture_height,
-                        "scale": 1
-                    }
-                }),
-            )
-            .await?
-            .get("data")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or("Chrome did not return a full-page screenshot.")?;
+        let scan = self.eval_wb(dom::FULL_SCAN_JS).await?;
+        let form_map = self.eval_wb(dom::FIELDS_JS).await.ok();
+        let has_form = form_map
+            .as_ref()
+            .and_then(|map| map["fields"].as_array())
+            .is_some_and(|fields| !fields.is_empty());
+        let viewport_w = scan["vw"].as_f64().unwrap_or(1200.0).max(1.0);
+        let viewport_h = scan["vh"].as_f64().unwrap_or(800.0).max(1.0);
+        let page_w = scan["width"].as_f64().unwrap_or(viewport_w).clamp(320.0, 2000.0);
+        let page_h = scan["height"].as_f64().unwrap_or(viewport_h).max(200.0);
+        let (scroll_x, scroll_y) = (
+            scan["sx"].as_f64().unwrap_or(0.0),
+            scan["sy"].as_f64().unwrap_or(0.0),
+        );
+        // A whole-page capture briefly resizes the viewport, which makes the page
+        // jump. Only do it when the page is short enough to stay legible.
+        let whole_page = page_h <= (viewport_h * 2.5).min(4000.0);
+        let shot = if whole_page {
+            let shot = self
+                .conn_call(
+                    "Page.captureScreenshot",
+                    json!({
+                        "format": "jpeg",
+                        "quality": 72,
+                        "fromSurface": true,
+                        "captureBeyondViewport": true,
+                        "clip": { "x": 0, "y": 0, "width": page_w, "height": page_h, "scale": 1 }
+                    }),
+                )
+                .await;
+            let _ = self
+                .eval(&format!(
+                    "window.scrollTo({{left:{scroll_x},top:{scroll_y},behavior:'instant'}});true"
+                ))
+                .await;
+            shot?
+                .get("data")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or("Chrome did not return a full-page screenshot.")?
+        } else {
+            self.screenshot().await?
+        };
         let _ = self.eval(HIDE_OVERLAY_JS).await;
-        // Full-page pixels are not viewport coordinates. Prefer page-wide indexes.
-        self.frame = None;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(shot.trim())
+            .unwrap_or_default();
+        let (css_w, css_h) = if whole_page { (page_w, page_h) } else { (viewport_w, viewport_h) };
+        let (img_w, img_h) = jpeg_size(&bytes).unwrap_or((css_w as u32, css_h as u32));
+        self.frame = Some(Frame {
+            img_w: img_w as f64,
+            img_h: img_h as f64,
+            css_w,
+            css_h,
+            page: whole_page,
+        });
 
         let mut lines = vec![
             format!("FULL PAGE SCAN — {}", scan["title"].as_str().unwrap_or("")),
             format!("url: {}", scan["url"].as_str().unwrap_or("")),
             format!(
-                "page size: {:.0}x{actual_height:.0} css pixels; screenshot covers the first {:.0} pixels",
-                css_width, capture_height
+                "page: {page_w:.0}x{page_h:.0} css px; viewport {viewport_w:.0}x{viewport_h:.0}, currently showing y={scroll_y:.0}–{:.0}.",
+                scroll_y + viewport_h
             ),
-            "These indexes cover controls across the whole page. Use an index; call browser_look for a fresh viewport before coordinate clicks.".into(),
+            if whole_page {
+                format!("screenshot: the whole page ({img_w}x{img_h} px). x,y clicks use these page pixels and scroll automatically.")
+            } else {
+                format!("screenshot: the current viewport only ({img_w}x{img_h} px). Every control on the page is still listed below.")
+            },
+            "Indexes stay valid until the page navigates. Clicking, typing, or filling an index scrolls to it automatically; do not scroll just to reach an index.".into(),
         ];
-        if actual_height > capture_height {
-            lines.push(format!(
-                "The page is very long; text and controls below screenshot pixel {:.0} are still listed.",
-                capture_height
-            ));
-        }
         if let Some(items) = scan["items"].as_array() {
             for item in items {
+                // The form map below describes fields in more detail.
+                if has_form && item["f"].as_bool() == Some(true) {
+                    continue;
+                }
                 let mut desc = format!(
                     "[{}] {}",
                     item["i"].as_i64().unwrap_or(0),
@@ -382,11 +476,15 @@ impl Browser {
                     desc.push_str(&format!(" value=\"{value}\""));
                 }
                 desc.push_str(&format!(
-                    " at page y={:.0}",
-                    item["y"].as_f64().unwrap_or(0.0)
+                    " at page y={:.0}{}",
+                    item["y"].as_f64().unwrap_or(0.0),
+                    if item["view"].as_bool() == Some(true) { " (in view)" } else { "" }
                 ));
                 lines.push(desc);
             }
+        }
+        if let Some(map) = form_map.as_ref().filter(|_| has_form) {
+            lines.push(dom::format_form_map(map));
         }
         if let Ok(targets) = self.file_targets().await {
             lines.push(describe_file_targets(&targets));
@@ -429,30 +527,22 @@ impl Browser {
 
     pub async fn review_form(&mut self) -> Result<String, String> {
         self.with_connection().await?;
-        let review = self
-            .eval(
-                r#"(function(){
-  const controls = [...document.querySelectorAll('input,textarea,select,[contenteditable="true"]')];
-  const fields = controls.map((el, i) => {
-    const labels = el.labels ? [...el.labels].map(x => x.innerText.trim()).filter(Boolean) : [];
-    const label = labels.join(' / ') || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('name') || el.id || `field ${i + 1}`;
-    const type = (el.getAttribute('type') || el.tagName).toLowerCase();
-    let value = type === 'password' ? (el.value ? '••••••' : '') : ('value' in el ? String(el.value || '') : String(el.innerText || ''));
-    if (type === 'checkbox' || type === 'radio') value = el.checked ? 'checked' : 'not checked';
-    if (el.tagName === 'SELECT') {
-      const option = el.options[el.selectedIndex];
-      value = option ? `${option.text} (${option.value})` : '';
+        let map = self.eval_wb(dom::FIELDS_JS).await?;
+        Ok(dom::format_review(&map))
     }
-    return { label: label.replace(/\s+/g,' ').slice(0,120), type, value: value.replace(/\s+/g,' ').slice(0,500) };
-  });
-  const actions = [...document.querySelectorAll('button,input[type="submit"],input[type="button"],[role="button"]')]
-    .map(el => (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g,' ').trim())
-    .filter(Boolean).slice(0,30);
-  return { title: document.title, url: location.href, fields, finalActions: actions };
-})()"#,
-            )
-            .await?;
-        serde_json::to_string_pretty(&review).map_err(|e| e.to_string())
+
+    /// The F12-style map of every fillable field on the page.
+    pub async fn form_fields(&mut self) -> Result<String, String> {
+        self.with_connection().await?;
+        let map = self.eval_wb(dom::FIELDS_JS).await?;
+        let scroll = &map["scroll"];
+        Ok(format!(
+            "{}\n(page scroll: y={} of {} px, viewport {} px tall)",
+            dom::format_form_map(&map),
+            scroll["y"].as_i64().unwrap_or(0),
+            scroll["h"].as_i64().unwrap_or(0),
+            scroll["vh"].as_i64().unwrap_or(0)
+        ))
     }
 
     pub async fn is_final_action_target(
@@ -460,18 +550,22 @@ impl Browser {
         index: Option<i64>,
         x: Option<f64>,
         y: Option<f64>,
+        selector: Option<&str>,
     ) -> Result<bool, String> {
         self.with_connection().await?;
         let target = if let Some(index) = index {
-            format!("(window.__wb_get ? window.__wb_get({index}) : document.querySelector('[data-wb=\"{index}\"]'))")
+            format!("window.__wb.get({index})")
+        } else if let Some(selector) = selector {
+            let quoted = serde_json::to_string(selector).map_err(|e| e.to_string())?;
+            format!("(function(){{try{{return window.__wb.queryAll({quoted})[0]||null;}}catch(e){{return null;}}}})()")
         } else if let (Some(x), Some(y)) = (x, y) {
-            let (cx, cy) = self.to_css(x, y);
+            let (cx, cy) = self.css_point(x, y).await?;
             format!("document.elementFromPoint({cx}, {cy})")
         } else {
             return Ok(false);
         };
         let result = self
-            .eval(&format!(
+            .eval_wb(&format!(
                 r#"(function(){{
   const el = {target};
   if (!el) return false;
@@ -498,7 +592,7 @@ impl Browser {
                 tokio::time::sleep(Duration::from_millis(400)).await;
             }
         }
-        let snap = self.eval(SNAPSHOT_JS).await?;
+        let snap = self.eval_wb(dom::SNAPSHOT_JS).await?;
         let shot = match self.screenshot().await {
             Ok(shot) => shot,
             Err(err) => {
@@ -518,6 +612,7 @@ impl Browser {
             img_h: img_h as f64,
             css_w,
             css_h,
+            page: false,
         });
         let scale_x = img_w as f64 / css_w;
         let scale_y = img_h as f64 / css_h;
@@ -529,6 +624,11 @@ impl Browser {
         lines.push(format!("title: {}", snap["title"].as_str().unwrap_or("")));
         lines.push(format!(
             "screenshot: {img_w}x{img_h} pixels. viewport: {css_w:.0}x{css_h:.0} css pixels."
+        ));
+        lines.push(describe_scroll(
+            snap["scroll"]["y"].as_f64().unwrap_or(0.0),
+            snap["scroll"]["h"].as_f64().unwrap_or(css_h),
+            css_h,
         ));
         lines.push(
             "Number badges in the image match these indexes. Click by index when you can. x,y are screenshot pixels."
@@ -567,6 +667,21 @@ impl Browser {
                 lines.push(desc);
             }
         }
+        if let Some(off) = snap["off"].as_array().filter(|off| !off.is_empty()) {
+            lines.push(
+                "Form fields outside the viewport (use their index directly; actions scroll to them):".into(),
+            );
+            for field in off {
+                lines.push(format!(
+                    "[{}] {} \"{}\" = \"{}\" ({})",
+                    field["i"].as_i64().unwrap_or(0),
+                    field["kind"].as_str().unwrap_or("field"),
+                    field["label"].as_str().unwrap_or(""),
+                    field["value"].as_str().unwrap_or(""),
+                    field["dir"].as_str().unwrap_or("off-screen")
+                ));
+            }
+        }
         if let Ok(targets) = self.file_targets().await {
             lines.push(describe_file_targets(&targets));
         }
@@ -591,23 +706,17 @@ impl Browser {
     pub async fn click(&mut self, index: Option<i64>, x: Option<f64>, y: Option<f64>, button: &str, count: u32) -> Result<String, String> {
         self.with_connection().await?;
         let _ = self.eval(HIDE_OVERLAY_JS).await;
-        let (cx, cy, label) = if let Some(index) = index {
-            let point = self
-                .eval(&format!(
-                    "(function(){{const el=(window.__wb_get?window.__wb_get({index}):null)||document.querySelector('[data-wb=\"{index}\"]');if(!el)return null;el.scrollIntoView({{block:'center',inline:'nearest'}});const r=el.getBoundingClientRect();el.focus();return {{x:r.left+r.width/2,y:r.top+r.height/2,label:(el.getAttribute('aria-label')||el.innerText||el.getAttribute('placeholder')||'').replace(/\\s+/g,' ').trim().slice(0,80)}};}})()"
-                ))
-                .await?;
-            if point.is_null() {
-                return Err(format!("Element [{index}] is not on the page. Look again."));
-            }
+        let (cx, cy, label, covered) = if let Some(index) = index {
+            let target = self.element_point(index).await?;
             (
-                point["x"].as_f64().unwrap_or(0.0),
-                point["y"].as_f64().unwrap_or(0.0),
-                format!("element [{index}] {}", point["label"].as_str().unwrap_or("")),
+                target.x,
+                target.y,
+                format!("element [{index}] {}", target.label),
+                target.blocker,
             )
         } else if let (Some(x), Some(y)) = (x, y) {
-            let (cx, cy) = self.to_css(x, y);
-            (cx, cy, format!("point ({x:.0},{y:.0})"))
+            let (cx, cy) = self.css_point(x, y).await?;
+            (cx, cy, format!("point ({x:.0},{y:.0})"), String::new())
         } else {
             return Err("Pass an element index or screenshot x and y.".into());
         };
@@ -615,9 +724,221 @@ impl Browser {
         // Fire exactly one trusted click. Calling el.click() before dispatching
         // mouse events consumed one-time login links twice.
         self.mouse_click(cx, cy, button, count.clamp(1, 3)).await?;
-        let note = self.follow_new_tab(&before).await;
+        let mut note = self.follow_new_tab(&before).await;
+        if !covered.is_empty() {
+            note.push_str(&format!(
+                " Warning: {covered} was on top of that spot, so it may have received the click. Close the overlay, or use browser_dom_edit js_click or hide."
+            ));
+        }
         self.settle().await;
         Ok(format!("Clicked {label} in Chrome.{note}"))
+    }
+
+    /// Fill many fields in one call. Fields are set through the DOM the way
+    /// DevTools would, then verified; fields the page rejects are retried with
+    /// trusted input, and custom dropdowns are opened and picked.
+    pub async fn fill_form(&mut self, specs: &[FieldSpec]) -> Result<(String, bool), String> {
+        self.with_connection().await?;
+        if specs.is_empty() {
+            return Err("browser_fill_form needs a fields list of {index or label, value}.".into());
+        }
+        if specs.len() > 80 {
+            return Err("Fill at most 80 fields per call.".into());
+        }
+        let _ = self.eval(HIDE_OVERLAY_JS).await;
+        let mut results = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let mut result = self.fill_one(spec).await;
+            // Dependent fields (State after Country, extra questions after a
+            // radio) often appear a moment after the previous change.
+            let note = result["note"].as_str().unwrap_or("");
+            if result["ok"].as_bool() != Some(true)
+                && (note.starts_with("not found") || note.starts_with("no option matches"))
+            {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                result = self.fill_one(spec).await;
+            }
+            results.push(result);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let all_ok = results.iter().all(|r| r["ok"].as_bool() == Some(true));
+        Ok((dom::format_fill_results(&results), all_ok))
+    }
+
+    async fn fill_one(&mut self, spec: &FieldSpec) -> Value {
+        let target = spec_target(spec);
+        let arg = json!([{
+            "index": spec.index,
+            "selector": spec.selector,
+            "label": spec.label,
+            "value": spec.value,
+        }]);
+        let mut result = match self.eval_wb(&dom::with_arg(dom::FILL_JS, &arg)).await {
+            Ok(value) => value["results"][0].clone(),
+            Err(err) => json!({ "ok": false, "note": err }),
+        };
+        if !result.is_object() {
+            result = json!({ "ok": false, "note": "the page did not answer" });
+        }
+        if result["target"].as_str().unwrap_or("").is_empty() {
+            result["target"] = json!(target);
+        }
+        let Some(id) = result["i"].as_i64() else {
+            return result;
+        };
+        if result["custom"].as_bool() == Some(true) {
+            let picked = self.fill_combobox(id, &spec.value, result["tag"].as_str() == Some("input")).await;
+            merge(&mut result, picked);
+        } else if result["retype"].as_bool() == Some(true) {
+            match self.type_text(Some(id), None, None, &spec.value, true, false).await {
+                Ok(_) => {
+                    let check = self.verify_field(id, &spec.value).await;
+                    merge(&mut result, check);
+                    if result["ok"].as_bool() != Some(true) {
+                        result["note"] = json!("the page did not keep this value; check its format, or browser_inspect the field");
+                    }
+                }
+                Err(err) => result["note"] = json!(err),
+            }
+        } else if let Some(trusted) = result["trusted"].as_i64() {
+            match self.click(Some(trusted), None, None, "left", 1).await {
+                Ok(_) => {
+                    let check = self.verify_field(trusted, &spec.value).await;
+                    merge(&mut result, check);
+                }
+                Err(err) => result["note"] = json!(err),
+            }
+        }
+        for key in ["custom", "retype", "trusted", "pick", "kind", "tag"] {
+            if let Some(map) = result.as_object_mut() {
+                map.remove(key);
+            }
+        }
+        result
+    }
+
+    async fn verify_field(&mut self, index: i64, value: &str) -> Value {
+        let arg = json!({ "i": index, "value": value });
+        self.eval_wb(&dom::with_arg(dom::VERIFY_JS, &arg))
+            .await
+            .unwrap_or_else(|err| json!({ "ok": false, "note": err }))
+    }
+
+    /// Open a custom dropdown or autocomplete, type to filter if it is a text
+    /// box, then click the option that matches `value`.
+    async fn fill_combobox(&mut self, index: i64, value: &str, typeable: bool) -> Value {
+        let opener = match self.element_point(index).await {
+            Ok(point) => point,
+            Err(err) => return json!({ "ok": false, "note": err }),
+        };
+        if let Err(err) = self.mouse_click(opener.x, opener.y, "left", 1).await {
+            return json!({ "ok": false, "note": err });
+        }
+        if typeable && !value.trim().is_empty() {
+            let clear = format!(
+                "(function(){{const el=window.__wb.get({index});if(!el)return false;try{{el.focus({{preventScroll:true}});}}catch(e){{}}window.__wb.nativeSet(el,'');window.__wb.fire(el,'input');return true;}})()"
+            );
+            let _ = self.eval_wb(&clear).await;
+            let _ = self.conn_call("Input.insertText", json!({ "text": value })).await;
+        }
+        let arg = json!({ "value": value });
+        let mut found = Value::Null;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            found = self
+                .eval_wb(&dom::with_arg(dom::OPTION_FIND_JS, &arg))
+                .await
+                .unwrap_or(Value::Null);
+            if found["pick"].as_i64().is_some() {
+                break;
+            }
+        }
+        if let Some(pick) = found["pick"].as_i64() {
+            match self.element_point(pick).await {
+                Ok(point) => {
+                    let _ = self.mouse_click(point.x, point.y, "left", 1).await;
+                }
+                Err(err) => return json!({ "ok": false, "note": err }),
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let mut check = self.verify_field(index, value).await;
+            if check["ok"].as_bool() != Some(true) {
+                // Many widgets render the chosen option away from the opener,
+                // so the opener's text cannot confirm the pick.
+                check["ok"] = json!(true);
+                check["value"] = found["text"].clone();
+                check["note"] = json!("picked this option; confirm it with browser_review");
+            }
+            return check;
+        }
+        let check = self.verify_field(index, value).await;
+        if check["ok"].as_bool() == Some(true) {
+            return check;
+        }
+        let _ = self.press_key("Escape").await;
+        let note = if found["count"].as_u64().unwrap_or(0) == 0 {
+            "opened it, but no options appeared; browser_look to see the widget"
+        } else {
+            "no option matches that value"
+        };
+        json!({ "ok": false, "note": note, "choices": found["choices"].clone(), "value": check["value"].clone() })
+    }
+
+    /// DevTools-style view of the page HTML: the main form by default, or the
+    /// subtree at an index or CSS selector.
+    pub async fn inspect(&mut self, index: Option<i64>, selector: Option<&str>, max: usize) -> Result<String, String> {
+        self.with_connection().await?;
+        let arg = json!({ "index": index, "selector": selector, "max": max.clamp(1000, 30000) });
+        let view = self.eval_wb(&dom::with_arg(dom::INSPECT_JS, &arg)).await?;
+        if let Some(err) = view["error"].as_str() {
+            return Err(err.to_string());
+        }
+        Ok(format!(
+            "HTML of {} (like the F12 Elements panel; data-wb=\"N\" is the Work Bot index to use with browser_click, browser_fill_form, or browser_dom_edit):\n{}",
+            view["what"].as_str().unwrap_or("the page"),
+            view["html"].as_str().unwrap_or("")
+        ))
+    }
+
+    /// Edit the live DOM the way you would in the F12 Elements panel.
+    pub async fn dom_edit(
+        &mut self,
+        action: &str,
+        index: Option<i64>,
+        selector: Option<&str>,
+        name: Option<&str>,
+        value: Option<&str>,
+        all: bool,
+    ) -> Result<String, String> {
+        self.with_connection().await?;
+        if index.is_none() && selector.is_none() {
+            return Err("browser_dom_edit needs an index or a CSS selector.".into());
+        }
+        let arg = json!({
+            "action": action,
+            "index": index,
+            "selector": selector,
+            "name": name,
+            "value": value,
+            "all": all,
+        });
+        let result = self.eval_wb(&dom::with_arg(dom::DOM_EDIT_JS, &arg)).await?;
+        if result["ok"].as_bool() != Some(true) {
+            return Err(result["error"].as_str().unwrap_or("The edit failed.").to_string());
+        }
+        let items: Vec<&str> = result["items"]
+            .as_array()
+            .map(|items| items.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if action == "js_click" {
+            self.settle().await;
+        }
+        Ok(format!(
+            "Applied {action} to {} element{}: {}",
+            items.len(),
+            if items.len() == 1 { "" } else { "s" },
+            items.join("; ")
+        ))
     }
 
     pub async fn type_text(&mut self, index: Option<i64>, x: Option<f64>, y: Option<f64>, text: &str, clear: bool, submit: bool) -> Result<String, String> {
@@ -626,35 +947,39 @@ impl Browser {
         if text.chars().count() > 8000 {
             return Err("That text is too long to type in one step.".into());
         }
-        let focus = if let Some(index) = index {
-            format!("((window.__wb_get?window.__wb_get({index}):null)||document.querySelector('[data-wb=\"{index}\"]'))")
+        let (focus, cx, cy) = if let Some(index) = index {
+            let target = self.element_point(index).await?;
+            (format!("window.__wb.get({index})"), target.x, target.y)
         } else if let (Some(x), Some(y)) = (x, y) {
-            let (cx, cy) = self.to_css(x, y);
-            format!("document.elementFromPoint({cx}, {cy})")
+            let (cx, cy) = self.css_point(x, y).await?;
+            (format!("document.elementFromPoint({cx}, {cy})"), cx, cy)
         } else {
             return Err("Pass the field index, or x and y, plus the text to type.".into());
         };
         let quoted = serde_json::to_string(text).map_err(|e| e.to_string())?;
         let clear_js = if clear { "true" } else { "false" };
         let prep = self
-            .eval(&format!(
-                "(function(){{const el={focus};if(!el)return null;el.scrollIntoView({{block:'center',inline:'nearest'}});const r=el.getBoundingClientRect();el.focus();if({clear_js} && 'value' in el){{const proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;const desc=Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set)desc.set.call(el,'');else el.value='';el.dispatchEvent(new Event('input',{{bubbles:true}}));}}return {{x:r.left+r.width/2,y:r.top+r.height/2,tag:el.tagName}};}})()"
+            .eval_wb(&format!(
+                "(function(){{const wb=window.__wb;const el={focus};if(!el)return null;try{{el.focus({{preventScroll:true}});}}catch(e){{}}if({clear_js}){{if(el.tagName==='INPUT'||el.tagName==='TEXTAREA'){{wb.nativeSet(el,'');wb.fire(el,'input');}}else if(el.isContentEditable){{try{{el.ownerDocument.getSelection().selectAllChildren(el);el.ownerDocument.execCommand('delete');}}catch(e){{}}}}}}return {{tag:el.tagName}};}})()"
             ))
             .await?;
         if prep.is_null() {
             return Err("Could not find that field. Look at the page again.".into());
         }
-        let cx = prep["x"].as_f64().unwrap_or(0.0);
-        let cy = prep["y"].as_f64().unwrap_or(0.0);
         self.mouse_click(cx, cy, "left", 1).await?;
         if clear {
-            self.chord("a", 2).await?;
-            self.press_key("Backspace").await?;
+            // The click can drop a caret mid-text; select everything so the
+            // inserted text replaces it.
+            let _ = self
+                .eval_wb(&format!(
+                    "(function(){{const el={focus};if(!el)return false;if(typeof el.select==='function')el.select();else if(el.isContentEditable)el.ownerDocument.getSelection().selectAllChildren(el);return true;}})()"
+                ))
+                .await;
         }
         self.conn_call("Input.insertText", json!({ "text": text })).await?;
         let check = self
-            .eval(&format!(
-                "(function(){{const el={focus};if(!el||!('value' in el))return {{ok:true,mode:'plain'}};const want={quoted};if(String(el.value).includes(want))return {{ok:true,mode:'insert'}};const proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;const desc=Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set)desc.set.call(el,want);else el.value=want;el.dispatchEvent(new InputEvent('input',{{bubbles:true,data:want,inputType:'insertText'}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return {{ok:String(el.value).includes(want),mode:'setter'}};}})()"
+            .eval_wb(&format!(
+                "(function(){{const wb=window.__wb;const el={focus};if(!el||!('value' in el)||(el.tagName!=='INPUT'&&el.tagName!=='TEXTAREA'))return {{ok:true,mode:'plain'}};const want={quoted};if(String(el.value).includes(want))return {{ok:true,mode:'insert'}};wb.nativeSet(el,want);wb.fire(el,'input');wb.fire(el,'change');return {{ok:String(el.value).includes(want),mode:'setter'}};}})()"
             ))
             .await?;
         if submit {
@@ -689,10 +1014,26 @@ impl Browser {
         Ok("Moved the pointer.".into())
     }
 
-    pub async fn scroll(&mut self, dx: f64, dy: f64, x: Option<f64>, y: Option<f64>) -> Result<String, String> {
+    pub async fn scroll(&mut self, dx: f64, dy: f64, x: Option<f64>, y: Option<f64>, to_index: Option<i64>) -> Result<String, String> {
         self.with_connection().await?;
+        let _ = self.eval(HIDE_OVERLAY_JS).await;
+        if let Some(index) = to_index {
+            let found = self
+                .eval_wb(&format!(
+                    "(function(){{const el=window.__wb.get({index});if(!el)return false;window.__wb.reveal(el,true);return true;}})()"
+                ))
+                .await?;
+            if found.as_bool() != Some(true) {
+                return Err(format!("Element [{index}] is not on the page. Look again."));
+            }
+            let info = self.scroll_info(None).await?;
+            return Ok(format!(
+                "Brought element [{index}] to the middle of the viewport. {}",
+                scroll_line(&info)
+            ));
+        }
         let (cx, cy) = match (x, y) {
-            (Some(x), Some(y)) => self.to_css(x, y),
+            (Some(x), Some(y)) => self.css_point(x, y).await?,
             _ => {
                 let size = self
                     .eval("({x: window.innerWidth/2, y: window.innerHeight/2})")
@@ -703,6 +1044,7 @@ impl Browser {
                 )
             }
         };
+        let before = self.scroll_info(Some((cx, cy))).await?;
         self.conn_call(
             "Input.dispatchMouseEvent",
             json!({
@@ -714,7 +1056,51 @@ impl Browser {
             }),
         )
         .await?;
-        Ok(format!("Scrolled by ({dx:.0}, {dy:.0})."))
+        // Smooth-scrolling pages keep moving after the wheel event. Wait until
+        // the position stops changing so the next screenshot is not mid-scroll.
+        let mut after = before.clone();
+        let mut still = 0;
+        for _ in 0..12 {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let now = self.scroll_info(Some((cx, cy))).await?;
+            if scroll_key(&now) == scroll_key(&after) {
+                still += 1;
+                if still >= 2 {
+                    break;
+                }
+            } else {
+                still = 0;
+            }
+            after = now;
+        }
+        if scroll_key(&after) == scroll_key(&before) {
+            return Ok(format!(
+                "The page did not move: it is already at the {} or the pointer is over an area that does not scroll. {} Fields with an index never need scrolling.",
+                if dy > 0.0 { "bottom" } else { "top" },
+                scroll_line(&after)
+            ));
+        }
+        let inner = if after["inner"].is_object() { " an inner scroll area" } else { "" };
+        Ok(format!(
+            "Scrolled{inner} {} by {:.0} px. {}",
+            if dy.abs() >= dx.abs() {
+                if dy > 0.0 { "down" } else { "up" }
+            } else if dx > 0.0 {
+                "right"
+            } else {
+                "left"
+            },
+            dy.abs().max(dx.abs()),
+            scroll_line(&after)
+        ))
+    }
+
+    async fn scroll_info(&mut self, at: Option<(f64, f64)>) -> Result<Value, String> {
+        let arg = match at {
+            Some((x, y)) => json!({ "x": x, "y": y }),
+            None => json!({}),
+        };
+        self.eval(&dom::with_arg(dom::SCROLL_INFO_JS, &arg)).await
     }
 
     pub async fn navigate(&mut self, url: &str) -> Result<String, String> {
@@ -916,20 +1302,18 @@ impl Browser {
     }
 
     pub async fn select_option(&mut self, index: i64, label: &str) -> Result<String, String> {
-        self.with_connection().await?;
-        let quoted = serde_json::to_string(label).map_err(|e| e.to_string())?;
-        let result = self
-            .eval(&format!(
-                "(function(){{const el=(window.__wb_get?window.__wb_get({index}):null)||document.querySelector('[data-wb=\"{index}\"]');if(!el||el.tagName!=='SELECT')return {{ok:false}};const want={quoted}.toLowerCase();const opt=[...el.options].find(o=>o.value.toLowerCase()===want||o.label.toLowerCase()===want||o.text.toLowerCase()===want||o.text.toLowerCase().includes(want));if(!opt)return {{ok:false,reason:'option'}};el.value=opt.value;el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return {{ok:true,value:opt.value,label:opt.label||opt.text}};}})()"
-            ))
-            .await?;
-        if result["ok"].as_bool() != Some(true) {
-            return Err(format!("Could not select \"{label}\"."));
+        let spec = FieldSpec {
+            index: Some(index),
+            selector: None,
+            label: None,
+            value: label.to_string(),
+        };
+        let (text, ok) = self.fill_form(std::slice::from_ref(&spec)).await?;
+        if ok {
+            Ok(text)
+        } else {
+            Err(text)
         }
-        Ok(format!(
-            "Selected {}.",
-            result["label"].as_str().unwrap_or(label)
-        ))
     }
 
     pub async fn tabs_text(&self) -> Result<String, String> {
@@ -1056,8 +1440,8 @@ impl Browser {
         let _ = self.eval(HIDE_OVERLAY_JS).await;
         let (cx, cy) = if let Some(index) = drop_index {
             let point = self
-                .eval(&format!(
-                    "(function(){{const el=window.__wb_drops&&window.__wb_drops[{index}];if(!el)return null;el.scrollIntoView({{block:'center',inline:'nearest'}});const r=el.getBoundingClientRect();return {{x:r.left+r.width/2,y:r.top+r.height/2}};}})()"
+                .eval_wb(&format!(
+                    "(function(){{const el=window.__wb_drops&&window.__wb_drops[{index}];if(!el)return null;return window.__wb.reveal(el);}})()"
                 ))
                 .await?;
             if point.is_null() {
@@ -1195,32 +1579,67 @@ impl Browser {
 
     async fn point(&mut self, index: Option<i64>, x: Option<f64>, y: Option<f64>) -> Result<(f64, f64), String> {
         if let Some(index) = index {
-            let point = self
-                .eval(&format!(
-                    "(function(){{const el=(window.__wb_get?window.__wb_get({index}):null)||document.querySelector('[data-wb=\"{index}\"]');if(!el)return null;const r=el.getBoundingClientRect();return {{x:r.left+r.width/2,y:r.top+r.height/2}};}})()"
-                ))
-                .await?;
-            if point.is_null() {
-                return Err(format!("Element [{index}] is gone. Look again."));
-            }
-            return Ok((
-                point["x"].as_f64().unwrap_or(0.0),
-                point["y"].as_f64().unwrap_or(0.0),
-            ));
+            let target = self.element_point(index).await?;
+            return Ok((target.x, target.y));
         }
         match (x, y) {
-            (Some(x), Some(y)) => Ok(self.to_css(x, y)),
+            (Some(x), Some(y)) => self.css_point(x, y).await,
             _ => Err("Pass an element index or screenshot x and y.".into()),
         }
     }
 
-    fn to_css(&self, x: f64, y: f64) -> (f64, f64) {
+    /// Viewport point for an indexed element. Scrolls instantly, and only when
+    /// the element is not already comfortably on screen.
+    async fn element_point(&mut self, index: i64) -> Result<Target, String> {
+        let point = self
+            .eval_wb(&format!(
+                r#"(function(){{
+  const wb = window.__wb;
+  let el = wb.get({index});
+  if (!el) return null;
+  const field = wb.isField(el);
+  const label = field ? wb.label(el) : wb.clean(el.getAttribute('aria-label') || el.innerText || el.value || el.getAttribute('placeholder') || '', 80);
+  // Styled checkboxes and radios hide the real input; click its label instead.
+  if (!wb.shown(el) && el.labels) {{ const lab = [...el.labels].find(wb.shown); if (lab) el = lab; }}
+  const p = wb.reveal(el);
+  return {{ x: p.x, y: p.y, label, blocker: wb.blocker(el, p) }};
+}})()"#
+            ))
+            .await?;
+        if point.is_null() {
+            return Err(format!(
+                "Element [{index}] is not on the page anymore. Call browser_look or browser_fields for current indexes."
+            ));
+        }
+        Ok(Target {
+            x: point["x"].as_f64().unwrap_or(0.0),
+            y: point["y"].as_f64().unwrap_or(0.0),
+            label: point["label"].as_str().unwrap_or("").to_string(),
+            blocker: point["blocker"].as_str().unwrap_or("").to_string(),
+        })
+    }
+
+    /// Convert screenshot pixels to a viewport point. Whole-page screenshots use
+    /// page pixels, so the point is scrolled into view first.
+    async fn css_point(&mut self, x: f64, y: f64) -> Result<(f64, f64), String> {
         let Some(frame) = &self.frame else {
-            return (x, y);
+            return Ok((x, y));
         };
         let sx = if frame.img_w > 0.0 { frame.css_w / frame.img_w } else { 1.0 };
         let sy = if frame.img_h > 0.0 { frame.css_h / frame.img_h } else { 1.0 };
-        (x * sx, y * sy)
+        let (px, py) = (x * sx, y * sy);
+        if !frame.page {
+            return Ok((px, py));
+        }
+        let point = self
+            .eval(&format!(
+                "(function(){{const px={px},py={py};let left=scrollX,top=scrollY;if(py<top+40||py>top+innerHeight-40)top=Math.max(0,py-innerHeight/2);if(px<left||px>left+innerWidth)left=Math.max(0,px-innerWidth/2);if(left!==scrollX||top!==scrollY)window.scrollTo({{left,top,behavior:'instant'}});return {{x:px-scrollX,y:py-scrollY}};}})()"
+            ))
+            .await?;
+        Ok((
+            point["x"].as_f64().unwrap_or(px),
+            point["y"].as_f64().unwrap_or(py),
+        ))
     }
 
     async fn mouse_click(&mut self, x: f64, y: f64, button: &str, count: u32) -> Result<(), String> {
@@ -1262,26 +1681,6 @@ impl Browser {
                 params["text"] = json!(key);
             }
             self.conn_call("Input.dispatchKeyEvent", params).await?;
-        }
-        Ok(())
-    }
-
-    async fn chord(&mut self, key: &str, modifiers: u32) -> Result<(), String> {
-        let vk = if key.eq_ignore_ascii_case("a") { 65 } else { 0 };
-        let code = format!("Key{}", key.to_uppercase());
-        for kind in ["keyDown", "keyUp"] {
-            self.conn_call(
-                "Input.dispatchKeyEvent",
-                json!({
-                    "type": kind,
-                    "key": key,
-                    "code": code,
-                    "windowsVirtualKeyCode": vk,
-                    "nativeVirtualKeyCode": vk,
-                    "modifiers": modifiers
-                }),
-            )
-            .await?;
         }
         Ok(())
     }
@@ -1373,6 +1772,16 @@ impl Browser {
             return Err(desc.to_string());
         }
         Ok(result["result"]["value"].clone())
+    }
+
+    /// Evaluate a script that uses `window.__wb`, installing it first if this
+    /// document does not have it yet.
+    async fn eval_wb(&mut self, body: &str) -> Result<Value, String> {
+        let value = self.eval(&dom::with_core(self.wb_next, body)).await?;
+        if let Some(next) = value.get("next").and_then(Value::as_u64) {
+            self.wb_next = self.wb_next.max(next);
+        }
+        Ok(value)
     }
 
     async fn conn_call(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -1836,132 +2245,6 @@ const FILE_CENSUS_JS: &str = r#"(function(){
   };
 })()"#;
 
-const SNAPSHOT_JS: &str = r#"(function(){
-  document.querySelectorAll('[data-wb]').forEach(function(el){ el.removeAttribute('data-wb'); });
-  window.__wb_els = {};
-  window.__wb_get = function(i){ return (window.__wb_els && window.__wb_els[i]) || document.querySelector('[data-wb="' + i + '"]'); };
-  var old = document.getElementById('wb-overlay');
-  if (old) old.remove();
-  var selectors = 'a[href],button,input,textarea,select,summary,[role="button"],[role="link"],[role="textbox"],[role="checkbox"],[role="radio"],[role="combobox"],[role="menuitem"],[role="tab"],[role="switch"],[contenteditable="true"]';
-  function collectAll(root, out) {
-    if (!root || out.length >= 220) return;
-    var found = root.querySelectorAll ? Array.from(root.querySelectorAll(selectors)) : [];
-    for (var k = 0; k < found.length; k++) {
-      out.push(found[k]);
-    }
-    var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
-    for (var m = 0; m < all.length; m++) {
-      if (all[m].shadowRoot) collectAll(all[m].shadowRoot, out);
-    }
-  }
-  var nodes = [];
-  collectAll(document, nodes);
-  var vw = window.innerWidth;
-  var vh = window.innerHeight;
-  var items = [];
-  for (var n = 0; n < nodes.length; n++) {
-    var el = nodes[n];
-    var r = el.getBoundingClientRect();
-    if (r.width < 4 || r.height < 4) continue;
-    if (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) continue;
-    var s = getComputedStyle(el);
-    if (s.visibility === 'hidden' || s.display === 'none' || Number(s.opacity) === 0) continue;
-    var id = items.length;
-    el.setAttribute('data-wb', String(id));
-    window.__wb_els[id] = el;
-    var typ = el.getAttribute('type') || '';
-    var raw = ('value' in el) ? String(el.value || '') : '';
-    if (typ === 'password' && raw) raw = '••••';
-    if ((typ === 'checkbox' || typ === 'radio') && 'checked' in el) {
-      raw = el.checked ? 'checked' : 'unchecked';
-    }
-    var text = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || el.innerText || el.getAttribute('name') || el.getAttribute('alt') || '').replace(/\s+/g, ' ').trim().slice(0, 90);
-    items.push({
-      i: id,
-      tag: el.tagName.toLowerCase(),
-      type: typ.slice(0, 24),
-      role: (el.getAttribute('role') || '').slice(0, 24),
-      text: text,
-      value: raw.slice(0, 80),
-      href: (el.href || '').slice(0, 140),
-      x: Math.round(r.left + r.width / 2),
-      y: Math.round(r.top + r.height / 2),
-      left: Math.round(r.left),
-      top: Math.round(r.top)
-    });
-    if (items.length >= 85) break;
-  }
-  var overlay = document.createElement('div');
-  overlay.id = 'wb-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483646;pointer-events:none;';
-  for (var j = 0; j < items.length; j++) {
-    var item = items[j];
-    var badge = document.createElement('div');
-    badge.textContent = String(item.i);
-    badge.style.cssText = 'position:fixed;left:' + Math.max(0, item.left) + 'px;top:' + Math.max(0, item.top) + 'px;z-index:2147483647;background:#1a1206;color:#ffd36a;font:700 11px/1.2 Segoe UI,sans-serif;padding:1px 4px;border-radius:4px;border:1px solid #ffd36a;pointer-events:none;';
-    overlay.appendChild(badge);
-  }
-  document.documentElement.appendChild(overlay);
-  var pageText = (document.body ? document.body.innerText : '').replace(/\n{3,}/g, '\n\n').slice(0, 1800);
-  return { url: location.href, title: document.title, vw: vw, vh: vh, items: items, pageText: pageText };
-})()"#;
-
-const FULL_SCAN_JS: &str = r#"(function(){
-  document.querySelectorAll('[data-wb]').forEach(function(el){ el.removeAttribute('data-wb'); });
-  window.__wb_els = {};
-  window.__wb_get = function(i){ return (window.__wb_els && window.__wb_els[i]) || document.querySelector('[data-wb="' + i + '"]'); };
-  var old = document.getElementById('wb-overlay');
-  if (old) old.remove();
-  var selectors = 'a[href],button,input,textarea,select,summary,[role="button"],[role="link"],[role="textbox"],[role="checkbox"],[role="radio"],[role="combobox"],[role="menuitem"],[role="tab"],[role="switch"],[contenteditable="true"]';
-  function collectAll(root, out) {
-    if (!root || out.length >= 300) return;
-    var found = root.querySelectorAll ? Array.from(root.querySelectorAll(selectors)) : [];
-    for (var k = 0; k < found.length; k++) {
-      out.push(found[k]);
-    }
-    var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
-    for (var m = 0; m < all.length; m++) {
-      if (all[m].shadowRoot) collectAll(all[m].shadowRoot, out);
-    }
-  }
-  var nodes = [];
-  collectAll(document, nodes);
-  var items = [];
-  var overlay = document.createElement('div');
-  overlay.id = 'wb-overlay';
-  overlay.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;z-index:2147483646;pointer-events:none;';
-  for (var n = 0; n < nodes.length; n++) {
-    var el = nodes[n];
-    var r = el.getBoundingClientRect();
-    if (r.width < 4 || r.height < 4) continue;
-    var s = getComputedStyle(el);
-    if (s.visibility === 'hidden' || s.display === 'none' || Number(s.opacity) === 0) continue;
-    var id = items.length;
-    el.setAttribute('data-wb', String(id));
-    window.__wb_els[id] = el;
-    var typ = el.getAttribute('type') || '';
-    var raw = ('value' in el) ? String(el.value || '') : '';
-    if (typ === 'password' && raw) raw = '••••';
-    if ((typ === 'checkbox' || typ === 'radio') && 'checked' in el) {
-      raw = el.checked ? 'checked' : 'unchecked';
-    }
-    var text = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || el.innerText || el.getAttribute('name') || el.getAttribute('alt') || '').replace(/\s+/g, ' ').trim().slice(0, 100);
-    var x = Math.round(r.left + scrollX + r.width / 2);
-    var y = Math.round(r.top + scrollY + r.height / 2);
-    items.push({ i:id, tag:el.tagName.toLowerCase(), type:typ.slice(0,24), text:text, value:raw.slice(0,120), x:x, y:y });
-    var badge = document.createElement('div');
-    badge.textContent = String(id);
-    badge.style.cssText = 'position:absolute;left:' + Math.max(0, Math.round(r.left + scrollX)) + 'px;top:' + Math.max(0, Math.round(r.top + scrollY)) + 'px;z-index:2147483647;background:#1a1206;color:#ffd36a;font:700 11px/1.2 Segoe UI,sans-serif;padding:1px 4px;border-radius:4px;border:1px solid #ffd36a;pointer-events:none;';
-    overlay.appendChild(badge);
-    if (items.length >= 200) break;
-  }
-  document.documentElement.appendChild(overlay);
-  var width = Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0, innerWidth);
-  var height = Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0, innerHeight);
-  var pageText = (document.body ? document.body.innerText : '').replace(/\n{3,}/g, '\n\n').slice(0, 14000);
-  return { url:location.href, title:document.title, width:width, height:height, items:items, pageText:pageText };
-})()"#;
-
 const HIDE_OVERLAY_JS: &str = r#"(function(){var n=document.getElementById('wb-overlay');if(n)n.remove();return true;})()"#;
 
 #[cfg(test)]
@@ -2090,7 +2373,7 @@ document.getElementById('go').onclick = function() {
             .unwrap();
         assert!(
             browser
-                .is_final_action_target(Some(button), None, None)
+                .is_final_action_target(Some(button), None, None, None)
                 .await
                 .unwrap(),
             "Send button was not recognized as a final action"
@@ -2139,5 +2422,190 @@ document.getElementById('go').onclick = function() {
             href.as_str().unwrap_or("").contains("childtab"),
             "stayed on the old tab: {href} / {result}"
         );
+    }
+
+    #[test]
+    fn describes_scroll_position() {
+        let top = super::describe_scroll(0.0, 3000.0, 800.0);
+        assert!(top.contains("y=0–800 of 3000"), "{top}");
+        assert!(top.contains("top of the page, 2200 px more below"), "{top}");
+        assert!(super::describe_scroll(2200.0, 3000.0, 800.0).contains("bottom of the page"));
+        assert!(super::describe_scroll(0.0, 600.0, 800.0).contains("fits on screen"));
+    }
+
+    async fn index_of(browser: &mut super::Browser, selector: &str) -> i64 {
+        let quoted = serde_json::to_string(selector).unwrap();
+        let value = browser
+            .eval(&format!("document.querySelector({quoted}).getAttribute('data-wb')"))
+            .await
+            .unwrap();
+        value
+            .as_str()
+            .unwrap_or_else(|| panic!("{selector} has no index"))
+            .parse()
+            .unwrap()
+    }
+
+    fn spec(index: Option<i64>, label: Option<&str>, value: &str) -> super::FieldSpec {
+        super::FieldSpec {
+            index,
+            selector: None,
+            label: label.map(str::to_string),
+            value: value.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fills_a_tricky_form_without_scrolling_around() {
+        let port = 9478u16;
+        let dir = std::env::temp_dir().join("gemma-work-bot-chrome-form-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let chrome = super::chrome_path().expect("chrome");
+        let child = std::process::Command::new(chrome)
+            .args([
+                format!("--remote-debugging-port={port}"),
+                "--remote-allow-origins=*".to_string(),
+                format!("--user-data-dir={}", dir.display()),
+                "--headless=new".to_string(),
+                "--disable-gpu".to_string(),
+                "--no-first-run".to_string(),
+                "--no-default-browser-check".to_string(),
+                "--window-size=1000,700".to_string(),
+                "about:blank".to_string(),
+            ])
+            .spawn()
+            .unwrap();
+        let _guard = Kill(child);
+        let mut browser = super::Browser::new(port);
+        for _ in 0..40 {
+            if browser.port_open().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        browser.attach_default().await.unwrap();
+        let html = r#"<!doctype html><html><head><style>html{scroll-behavior:smooth}label{display:block;margin-top:6px}</style></head><body>
+<form id="f">
+<h2>Personal</h2>
+<label for="first">First name</label><input id="first" name="first" required>
+<label>Email <input id="email" type="email" required></label>
+<label for="dob">Date of birth</label><input id="dob" type="date">
+<h2>Location</h2>
+<label for="country">Country</label>
+<select id="country"><option value="">Select…</option><option value="us">United States</option><option value="ca">Canada</option></select>
+<label for="state">State</label><select id="state"><option value="">Select…</option></select>
+<fieldset><legend>Authorized to work?</legend>
+<label><input type="radio" name="auth" value="y">Yes</label>
+<label><input type="radio" name="auth" value="n">No</label></fieldset>
+<label><input id="agree" type="checkbox" style="opacity:0;position:absolute;width:1px;height:1px">I agree to the terms</label>
+<div id="combo" role="combobox" aria-label="Start date" tabindex="0" style="border:1px solid #999;padding:4px;width:200px">Choose…</div>
+<ul id="list" role="listbox" style="display:none"><li role="option">Immediately</li><li role="option">In two weeks</li><li role="option">In a month</li></ul>
+<label for="code">Referral code</label><input id="code" readonly>
+<div style="height:3000px"></div>
+<label for="notes">Notes</label><textarea id="notes"></textarea>
+<button id="send" type="submit">Submit application</button>
+</form>
+<script>
+window.inputs = 0;
+document.getElementById('first').addEventListener('input', () => window.inputs++);
+document.getElementById('country').addEventListener('change', (e) => {
+  setTimeout(() => {
+    document.getElementById('state').innerHTML = '<option value="">Select…</option>' +
+      (e.target.value === 'us' ? '<option>California</option><option>Texas</option>' : '<option>Ontario</option>');
+  }, 300);
+});
+const combo = document.getElementById('combo'), list = document.getElementById('list');
+combo.addEventListener('click', () => { list.style.display = 'block'; });
+list.addEventListener('click', (e) => {
+  const o = e.target.closest('[role=option]');
+  if (o) { combo.textContent = o.textContent; list.style.display = 'none'; }
+});
+document.getElementById('f').addEventListener('submit', (e) => e.preventDefault());
+</script></body></html>"#;
+        let quoted = serde_json::to_string(html).unwrap();
+        browser
+            .eval(&format!("document.open();document.write({quoted});document.close();true"))
+            .await
+            .unwrap();
+
+        let map = browser.form_fields().await.unwrap();
+        assert!(map.contains("FORM MAP — 10 fields, 2 required still empty"), "{map}");
+        assert!(!map.contains("not listed"), "{map}");
+        assert!(map.contains("\"First name\" *required"), "{map}");
+        assert!(map.contains("— Location —"), "{map}");
+        assert!(map.contains("radio \"Authorized to work?\""), "{map}");
+        assert!(map.contains("textarea \"Notes\""), "{map}");
+        assert!(map.contains("(below the viewport)"), "{map}");
+        assert!(map.contains("(final)"), "{map}");
+
+        let first = index_of(&mut browser, "#first").await;
+        browser.observe().await.unwrap();
+        browser.form_fields().await.unwrap();
+        assert_eq!(index_of(&mut browser, "#first").await, first, "indexes were renumbered");
+
+        let email = index_of(&mut browser, "#email").await;
+        let dob = index_of(&mut browser, "#dob").await;
+        let country = index_of(&mut browser, "#country").await;
+        let state = index_of(&mut browser, "#state").await;
+        let agree = index_of(&mut browser, "#agree").await;
+        let notes = index_of(&mut browser, "#notes").await;
+        let (report, ok) = browser
+            .fill_form(&[
+                spec(Some(first), None, "Ada"),
+                spec(Some(email), None, "ada@example.com"),
+                spec(Some(dob), None, "03/15/1990"),
+                spec(Some(country), None, "United States"),
+                spec(Some(state), None, "Texas"),
+                spec(None, Some("Authorized to work?"), "Yes"),
+                spec(Some(agree), None, "true"),
+                spec(Some(notes), None, "Available for an interview any weekday."),
+            ])
+            .await
+            .unwrap();
+        assert!(ok, "{report}");
+        let scroll = browser.eval("scrollY").await.unwrap();
+        assert_eq!(scroll.as_f64(), Some(0.0), "filling scrolled the page: {report}");
+        let values = browser
+            .eval("JSON.stringify([first.value, window.inputs > 0, dob.value, country.value, state.value, document.querySelector('[name=auth][value=y]').checked, agree.checked, notes.value])")
+            .await
+            .unwrap();
+        assert_eq!(
+            values.as_str().unwrap(),
+            r#"["Ada",true,"1990-03-15","us","Texas",true,true,"Available for an interview any weekday."]"#,
+            "{report}"
+        );
+
+        let combo = index_of(&mut browser, "#combo").await;
+        let (report, ok) = browser.fill_form(&[spec(Some(combo), None, "two weeks")]).await.unwrap();
+        assert!(ok, "{report}");
+        let picked = browser.eval("combo.textContent").await.unwrap();
+        assert_eq!(picked.as_str(), Some("In two weeks"), "{report}");
+
+        let code = index_of(&mut browser, "#code").await;
+        let (report, ok) = browser.fill_form(&[spec(Some(code), None, "FRIEND-42")]).await.unwrap();
+        assert!(!ok && report.contains("read-only"), "{report}");
+        browser
+            .dom_edit("remove_attribute", Some(code), None, Some("readonly"), None, false)
+            .await
+            .unwrap();
+        let (report, ok) = browser.fill_form(&[spec(Some(code), None, "FRIEND-42")]).await.unwrap();
+        assert!(ok, "{report}");
+
+        let html = browser.inspect(None, None, 12000).await.unwrap();
+        assert!(html.contains("the main form"), "{html}");
+        assert!(html.contains("name=\"first\""), "{html}");
+        assert!(html.contains(&format!("data-wb=\"{first}\"")), "{html}");
+
+        let review = browser.review_form().await.unwrap();
+        assert!(review.contains("Ada") && !review.contains("Required but empty"), "{review}");
+        let send = index_of(&mut browser, "#send").await;
+        assert!(browser.is_final_action_target(Some(send), None, None, None).await.unwrap());
+
+        let moved = browser.scroll(0.0, 500.0, None, None, None).await.unwrap();
+        assert!(moved.contains("Scrolled down"), "{moved}");
+        assert!(moved.contains("scroll: showing y=500"), "smooth scroll was not awaited: {moved}");
+        let jumped = browser.scroll(0.0, 0.0, None, None, Some(notes)).await.unwrap();
+        assert!(jumped.contains("Brought element"), "{jumped}");
     }
 }
